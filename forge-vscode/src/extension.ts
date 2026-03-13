@@ -235,7 +235,7 @@ export function activate(context: vscode.ExtensionContext) {
             const client = await auth.getClient();
 
             const location = "us-central1";
-            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/6195034439471333376";
+            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/6768680442007650304";
             const url = `https://${location}-aiplatform.googleapis.com/v1beta1/${endpointId}:query`;
 
             let currentAgent: string | null = "orchestrator";
