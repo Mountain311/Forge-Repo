@@ -12,34 +12,81 @@ from vertexai.generative_models import GenerativeModel, Tool, Part, FunctionDecl
 from tools import tool_map
 
 # ---------------------------------------------------------------------------
-# Logging Setup
+# Logging Setup — writes structured JSON directly to Google Cloud Logging
+# so you can query it in the Cloud Console Logs Explorer.
+#
+# Filter in Logs Explorer:
+#   logName="projects/nastwest-u26wck-607/logs/forge_engine"
+#
+# To see only request/response payloads:
+#   logName="projects/nastwest-u26wck-607/logs/forge_engine"
+#   jsonPayload.event=~"REQUEST|RESPONSE"
 # ---------------------------------------------------------------------------
-# Logs go to stderr (captured by Cloud Run / Vertex AI logs) AND a local file.
-# Set env var FORGE_LOG_LEVEL=DEBUG for maximum verbosity.
-# ---------------------------------------------------------------------------
-_log_level = os.environ.get("FORGE_LOG_LEVEL", "DEBUG").upper()
+try:
+    import google.cloud.logging as gcloud_logging
+    from google.cloud.logging.handlers import CloudLoggingHandler
+
+    _gcloud_client = gcloud_logging.Client(project="nastwest-u26wck-607")
+    _cloud_handler = CloudLoggingHandler(_gcloud_client, name="forge_engine")
+    _cloud_handler.setLevel(logging.DEBUG)
+    _use_cloud_logging = True
+except Exception as _e:
+    _use_cloud_logging = False
+    print(f"[forge_engine] WARNING: google-cloud-logging unavailable ({_e}), falling back to stderr")
 
 logging.basicConfig(
-    level=getattr(logging, _log_level, logging.DEBUG),
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("forge_engine")
+logger.setLevel(logging.DEBUG)
 
-# Also write to a rolling file so you can inspect locally
-_log_file = os.environ.get("FORGE_LOG_FILE", "/tmp/forge_engine.log")
-_fh = logging.FileHandler(_log_file, encoding="utf-8")
-_fh.setLevel(logging.DEBUG)
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(_fh)
+if _use_cloud_logging:
+    logger.addHandler(_cloud_handler)
 
-logger.info(f"Forge Engine logging initialised — level={_log_level}, file={_log_file}")
+# Structured log helper — writes a JSON payload so fields are queryable
+# in Logs Explorer (e.g. jsonPayload.agent, jsonPayload.event)
+_gcloud_logger = _gcloud_client.logger("forge_engine") if _use_cloud_logging else None
+
+def clog(event: str, severity: str = "DEBUG", **fields):
+    """Write a structured log entry visible in Cloud Logging Logs Explorer."""
+    payload = {"event": event, **fields}
+    if _gcloud_logger:
+        _gcloud_logger.log_struct(payload, severity=severity)
+    # Always also print to stderr as a fallback
+    print(f"[{severity}] {json.dumps(payload, default=str)}", flush=True)
+
+clog("ENGINE_INIT", severity="INFO", message="Forge Engine logging initialised")
 
 
 def _truncate(value: any, max_chars: int = 400) -> str:
     """Return a safely truncated string representation of any value."""
     s = value if isinstance(value, str) else json.dumps(value, default=str)
     return s[:max_chars] + ("…" if len(s) > max_chars else "")
+
+
+def _serialise_contents(contents: list) -> list:
+    """Convert Vertex AI Content objects into plain dicts for structured logging."""
+    result = []
+    for c in contents:
+        parts = []
+        for p in c.parts:
+            try:
+                if hasattr(p, 'function_call') and p.function_call.name:
+                    parts.append({
+                        "type": "function_call",
+                        "name": p.function_call.name,
+                        "args": {k: v for k, v in p.function_call.args.items()}
+                    })
+                elif hasattr(p, 'text') and p.text:
+                    parts.append({"type": "text", "text": p.text})
+                else:
+                    parts.append({"type": "unknown"})
+            except Exception:
+                parts.append({"type": "unreadable"})
+        result.append({"role": c.role, "parts": parts})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -180,16 +227,18 @@ class ForgeEngine:
         chat_history: list = None,
     ) -> dict:
         """Public entrypoint. Multiplexes all agent tasks."""
-        logger.info(
-            f"query() called — agent={agent_name} "
-            f"has_prompt={prompt is not None} "
-            f"has_message={message is not None} "
-            f"history_len={len(chat_history) if chat_history else 0}"
-        )
+        # Log the full incoming request so it appears in Cloud Logging
+        clog("INCOMING_REQUEST", severity="INFO",
+             agent=agent_name,
+             prompt=prompt,
+             context=context,
+             message=message,
+             history_len=len(chat_history) if chat_history else 0,
+             chat_history=chat_history)
+
         self._ensure_initialized()
 
         if message is not None:
-            logger.debug(f"Continuation message for {agent_name}: {_truncate(message)}")
             return self._send_message_to_agent(agent_name, message, chat_history)
 
         if agent_name == "orchestrator":
@@ -202,7 +251,6 @@ class ForgeEngine:
             initial_prompt = prompt
 
         logger.info(f"Fresh start for agent '{agent_name}'")
-        logger.debug(f"Initial prompt: {_truncate(initial_prompt)}")
         return self._send_message_to_agent(agent_name, initial_prompt, [])
 
     # ------------------------------------------------------------------
@@ -320,31 +368,42 @@ class ForgeEngine:
                     part_summaries.append("(unreadable part)")
             logger.debug(f"  contents[{i}] role={c.role} parts=[{', '.join(part_summaries)}]")
 
+        # Log EXACTLY what is being sent to the model
+        clog("GENERATE_CONTENT_REQUEST", severity="INFO",
+             agent=agent_name,
+             model=model_name,
+             num_turns=len(contents),
+             contents=_serialise_contents(contents))
+
         t_start = time.time()
         try:
             response = model.generate_content(contents)
         except Exception as exc:
-            logger.error(f"generate_content raised an exception: {exc}", exc_info=True)
+            clog("GENERATE_CONTENT_ERROR", severity="ERROR",
+                 agent=agent_name, error=str(exc))
             raise
 
         duration_ms = int((time.time() - t_start) * 1000)
 
-        # ── Log raw response ─────────────────────────────────────────────
-        logger.info(f"generate_content returned in {duration_ms}ms")
-        try:
-            finish_reason = response.candidates[0].finish_reason
-            logger.info(f"finish_reason: {finish_reason}")
-        except Exception:
-            logger.warning("Could not read finish_reason from response")
-
         fn_calls = self._extract_function_calls(response)
         response_text = self._extract_text(response)
 
-        logger.debug(f"Extracted text ({len(response_text)} chars): {_truncate(response_text)}")
-        logger.info(f"Function calls ({len(fn_calls)}): {[c.name for c in fn_calls]}")
-        for i, c in enumerate(fn_calls):
-            args_preview = {k: _truncate(v) for k, v in c.args.items()}
-            logger.debug(f"  fn_call[{i}]: {c.name}({args_preview})")
+        try:
+            finish_reason = str(response.candidates[0].finish_reason)
+        except Exception:
+            finish_reason = "unknown"
+
+        # Log EXACTLY what came back from the model
+        clog("GENERATE_CONTENT_RESPONSE", severity="INFO",
+             agent=agent_name,
+             model=model_name,
+             duration_ms=duration_ms,
+             finish_reason=finish_reason,
+             response_text=response_text,
+             function_calls=[
+                 {"name": c.name, "args": {k: v for k, v in c.args.items()}}
+                 for c in fn_calls
+             ])
 
         # ── Build and return result ──────────────────────────────────────
         if fn_calls:
@@ -364,7 +423,6 @@ class ForgeEngine:
                     ]
                 }
             }
-            logger.info(f"Returning 'function_calls' response with {len(serialized_calls)} call(s)")
         else:
             result = {
                 "type": "text",
@@ -374,7 +432,13 @@ class ForgeEngine:
                     "parts": [{"text": response_text}]
                 }
             }
-            logger.info(f"Returning 'text' response: {_truncate(response_text)}")
+
+        # Log the full response being returned to the VS Code extension
+        clog("OUTGOING_RESPONSE", severity="INFO",
+             agent=agent_name,
+             result_type=result["type"],
+             response_text=response_text,
+             function_calls=result.get("calls", []))
 
         return result
 
