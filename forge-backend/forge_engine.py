@@ -4,14 +4,48 @@ load_dotenv()
 import yaml
 import json
 import os
+import logging
+import time
 from pathlib import Path
 import vertexai
 from vertexai.generative_models import GenerativeModel, Tool, Part, FunctionDeclaration
 from tools import tool_map
 
-# --- Function Declaration Schemas ---
+# ---------------------------------------------------------------------------
+# Logging Setup
+# ---------------------------------------------------------------------------
+# Logs go to stderr (captured by Cloud Run / Vertex AI logs) AND a local file.
+# Set env var FORGE_LOG_LEVEL=DEBUG for maximum verbosity.
+# ---------------------------------------------------------------------------
+_log_level = os.environ.get("FORGE_LOG_LEVEL", "DEBUG").upper()
 
-# 1. Read File Schema
+logging.basicConfig(
+    level=getattr(logging, _log_level, logging.DEBUG),
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("forge_engine")
+
+# Also write to a rolling file so you can inspect locally
+_log_file = os.environ.get("FORGE_LOG_FILE", "/tmp/forge_engine.log")
+_fh = logging.FileHandler(_log_file, encoding="utf-8")
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_fh)
+
+logger.info(f"Forge Engine logging initialised — level={_log_level}, file={_log_file}")
+
+
+def _truncate(value: any, max_chars: int = 400) -> str:
+    """Return a safely truncated string representation of any value."""
+    s = value if isinstance(value, str) else json.dumps(value, default=str)
+    return s[:max_chars] + ("…" if len(s) > max_chars else "")
+
+
+# ---------------------------------------------------------------------------
+# Function Declaration Schemas
+# ---------------------------------------------------------------------------
+
 read_file_func = FunctionDeclaration(
     name="read_file",
     description="Reads the content of a file from the sandbox.",
@@ -22,38 +56,35 @@ read_file_func = FunctionDeclaration(
     }
 )
 
-# 2a. Create Artifact Schema
 create_artifact_func = FunctionDeclaration(
     name="create_artifact",
     description="Creates or updates a planning artifact (e.g., .md files in the .forge/ directory).",
     parameters={
         "type": "object",
         "properties": {
-            "filepath": {"type": "string", "description": "The exact path to the file (e.g., '.forge/Task_list.md')."},
+            "filepath": {"type": "string", "description": "The exact path to the file."},
             "content": {"type": "string", "description": "The full markdown content to write."}
         },
         "required": ["filepath", "content"]
     }
 )
 
-# 2b. Write Code Schema
 write_code_func = FunctionDeclaration(
     name="write_code",
-    description="Writes application code to a file in the workspace. Overwrites existing files.",
+    description="Writes application code to a file in the workspace.",
     parameters={
         "type": "object",
         "properties": {
-            "filepath": {"type": "string", "description": "The exact path to the source code file (e.g., 'src/main.py')."},
+            "filepath": {"type": "string", "description": "The exact path to the source code file."},
             "content": {"type": "string", "description": "The full code snippet to write."}
         },
         "required": ["filepath", "content"]
     }
 )
 
-# 3. Execute Command Schema
 execute_command_func = FunctionDeclaration(
     name="execute_command",
-    description="Executes a bash command in the terminal (e.g., running pytest, node, etc.) and returns the output.",
+    description="Executes a bash command and returns the output.",
     parameters={
         "type": "object",
         "properties": {"command": {"type": "string", "description": "The terminal command to run."}},
@@ -61,103 +92,133 @@ execute_command_func = FunctionDeclaration(
     }
 )
 
-# 4. Update Task Status Schema
 update_task_status_func = FunctionDeclaration(
     name="update_task_status",
     description="Updates the checkbox status of a specific task in a markdown task list.",
     parameters={
         "type": "object",
         "properties": {
-            "filepath": {"type": "string", "description": "The exact path to the file."},
-            "task_string": {"type": "string", "description": "The exact task text string to search for in the markdown file."},
-            "new_status": {"type": "string", "description": "The new status character to place in the brackets (e.g., 'x', ' ', '/')."}
+            "filepath": {"type": "string"},
+            "task_string": {"type": "string"},
+            "new_status": {"type": "string"}
         },
         "required": ["filepath", "task_string", "new_status"]
     }
 )
 
-# 5. List Directory Schema
 list_directory_func = FunctionDeclaration(
     name="list_directory",
-    description="Returns the contents (files and folders) of a specified directory.",
+    description="Returns the contents of a specified directory.",
     parameters={
         "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "The relative or absolute path of the directory to list (e.g., './src')."}
-        },
+        "properties": {"path": {"type": "string", "description": "The directory path to list."}},
         "required": ["path"]
     }
 )
 
-# 6. Search Code Schema
 search_code_func = FunctionDeclaration(
     name="search_code",
-    description="Searches all files in a directory for a specific text, class, or function name (like grep).",
+    description="Searches for a string across source files in the workspace.",
     parameters={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "The text pattern or keyword to search for."},
-            "directory": {"type": "string", "description": "The directory to search within (e.g., './')."}
+            "query": {"type": "string"},
+            "directory": {"type": "string"}
         },
         "required": ["query", "directory"]
     }
 )
 
-# Bind them into a Vertex AI Tool
-forge_tools = Tool(function_declarations=[read_file_func, create_artifact_func, write_code_func, execute_command_func, update_task_status_func, list_directory_func, search_code_func])
+forge_tools = Tool(function_declarations=[
+    read_file_func,
+    create_artifact_func,
+    write_code_func,
+    execute_command_func,
+    update_task_status_func,
+    list_directory_func,
+    search_code_func,
+])
 
 
+# ---------------------------------------------------------------------------
+# ForgeEngine
+# ---------------------------------------------------------------------------
 class ForgeEngine:
+
     def __init__(self):
         self.configs = {}
         self._initialized = False
 
     def _ensure_initialized(self):
-        """Lazy initialization — runs on first query, not at pickle time."""
         if self._initialized:
             return
-        vertexai.init()
-        # Resolve configs relative to this file's location (works locally and in cloud)
-        config_dir = Path(__file__).parent / "agent_configs"
-        if not config_dir.exists():
-            # Fallback for cloud environment where extra_packages are extracted
-            config_dir = Path("agent_configs")
-        for file in config_dir.glob("*.yaml"):
-            with open(file, "r") as f:
-                self.configs[file.stem] = yaml.safe_load(f)
-        self._initialized = True
+        logger.info("Initialising Forge Engine…")
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "nastwest-u26wck-607")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        logger.info(f"Vertex AI project={project} location={location}")
+        vertexai.init(project=project, location=location)
 
-    def query(self, prompt: str = None, context: str = "", message: str = None, chat_history: list = None, agent_name: str = "orchestrator") -> dict:
-        """Entry point from VS Code. Multiplexes all agent tasks."""
+        config_dir = Path(__file__).parent / "agent_configs"
+        logger.info(f"Loading agent configs from: {config_dir}")
+        for config_file in config_dir.glob("*.yaml"):
+            with open(config_file, "r") as f:
+                config = yaml.safe_load(f)
+            agent_name = config_file.stem
+            self.configs[agent_name] = config
+            logger.info(f"  Loaded config: {agent_name} (model={config.get('model', '?')})")
+
+        self._initialized = True
+        logger.info("Forge Engine initialised successfully.")
+
+    # ------------------------------------------------------------------
+    def query(
+        self,
+        agent_name: str,
+        prompt: str = None,
+        context: str = None,
+        message: str = None,
+        chat_history: list = None,
+    ) -> dict:
+        """Public entrypoint. Multiplexes all agent tasks."""
+        logger.info(
+            f"query() called — agent={agent_name} "
+            f"has_prompt={prompt is not None} "
+            f"has_message={message is not None} "
+            f"history_len={len(chat_history) if chat_history else 0}"
+        )
         self._ensure_initialized()
-        
-        # If 'message' is present, this is a continuation of a specific agent's loop
+
         if message is not None:
+            logger.debug(f"Continuation message for {agent_name}: {_truncate(message)}")
             return self._send_message_to_agent(agent_name, message, chat_history)
-        
-        # Otherwise, this is a fresh start for the specified agent
+
         if agent_name == "orchestrator":
-            initial_prompt = f"User Request: {prompt}\nCode Context:\n{context}\n\nPlease determine the next routing step. Use tools to read files if necessary."
+            initial_prompt = (
+                f"User Request: {prompt}\n"
+                f"Code Context:\n{context}\n\n"
+                f"Please determine the next routing step. Use tools to read files if necessary."
+            )
         else:
             initial_prompt = prompt
-            
+
+        logger.info(f"Fresh start for agent '{agent_name}'")
+        logger.debug(f"Initial prompt: {_truncate(initial_prompt)}")
         return self._send_message_to_agent(agent_name, initial_prompt, [])
 
+    # ------------------------------------------------------------------
     @staticmethod
     def _extract_function_calls(response):
-        """Extract function calls from a GenerationResponse's parts."""
         calls = []
         try:
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'function_call') and part.function_call.name:
                     calls.append(part.function_call)
-        except (IndexError, AttributeError):
-            pass
+        except (IndexError, AttributeError) as e:
+            logger.warning(f"_extract_function_calls: {e}")
         return calls
 
     @staticmethod
     def _extract_text(response):
-        """Extract text from a GenerationResponse's parts to avoid multiple-parts exception."""
         text = ""
         try:
             for part in response.candidates[0].content.parts:
@@ -168,54 +229,42 @@ class ForgeEngine:
                         text += part.text + "\n"
                 except AttributeError:
                     pass
-        except IndexError:
-            pass
+        except IndexError as e:
+            logger.warning(f"_extract_text: {e}")
         return text.strip()
 
-    def _send_message_to_agent(self, agent_name: str, message: str, chat_history: list = None) -> dict:
-        """
-        Generic internal handler for any Agent.
-        Returns the tool call requests to the client, and expects the client to call this method
-        again via query() with the tool execution results.
-        """
+    # ------------------------------------------------------------------
+    def _send_message_to_agent(
+        self,
+        agent_name: str,
+        message: str,
+        chat_history: list = None,
+    ) -> dict:
         self._ensure_initialized()
-        
+
         if agent_name not in self.configs:
-            return {"type": "text", "text": f"Error: Agent '{agent_name}' not found.", "raw_assistant_message": {"role": "model", "parts": [{"text": "Error"}]}}
-            
+            err = f"Error: Agent '{agent_name}' not found."
+            logger.error(err)
+            return {"type": "text", "text": err, "raw_assistant_message": {"role": "model", "parts": [{"text": err}]}}
+
         config = self.configs[agent_name]
-        
-        # Pass tools to ALL agents, assuming they all might need file ops
-        # In a more advanced setup, you'd filter forge_tools by config["tools"]
+        model_name = config["model"]
+        logger.info(f"_send_message_to_agent — agent={agent_name} model={model_name}")
+
         model = GenerativeModel(
-            config["model"],
+            model_name,
             system_instruction=config["instructions"],
             tools=[forge_tools]
         )
-        
-        # 1. Reconstruct chat session state
-        history_parts = []
-        if chat_history:
-            for msg in chat_history:
-                role = msg.get("role")
-                
-                # We have to parse the stringified parts back into objects for Vertex AI
-                # This depends on how the VS Code extension serializes history.
-                # For simplicity in this architecture, we will rely on Vertex AI's
-                # ability to accept a list of 'Content' objects or raw dictionaries.
-                # However, an easier approach is to have the VS Code extension manage
-                # the *entire* message array and just use generate_content instead of start_chat.
-        
-        # Actually, since Vertex AI Reasoning Engines are stateless between API calls,
-        # start_chat() with history is complex to serialize back and forth between TS and Python.
-        # The standard approach for stateful Agent APIs is to use generate_content with
-        # the full conversation history. Let's implement that.
-        
+
+        # ── Reconstruct history ──────────────────────────────────────────
+        import vertexai.generative_models as gm
         contents = []
+
         if chat_history:
-            for msg in chat_history:
+            logger.debug(f"Reconstructing chat history ({len(chat_history)} messages)")
+            for idx, msg in enumerate(chat_history):
                 role = msg["role"]
-                # Convert the raw dictionaries from VS Code into Vertex AI Part objects
                 parts = []
                 for p in msg["parts"]:
                     if "text" in p:
@@ -227,67 +276,108 @@ class ForgeEngine:
                             name=p["functionResponse"]["name"],
                             response=p["functionResponse"]["response"]
                         ))
-                
-                import vertexai.generative_models as gm
                 contents.append(gm.Content(role=role, parts=parts))
-        
-        # Create the new user message part
-        # The VS Code extension will send either a text prompt or a list of functionResponse dicts
+                logger.debug(f"  History[{idx}] role={role} parts={len(parts)}")
+
+        # ── Append new user message ──────────────────────────────────────
         try:
-            # Check if message is a JSON representation of function responses
             parsed_msg = json.loads(message)
-            if isinstance(parsed_msg, list) and len(parsed_msg) > 0 and "functionResponse" in parsed_msg[0]:
-                new_parts = []
-                for p in parsed_msg:
-                     new_parts.append(Part.from_function_response(
-                            name=p["functionResponse"]["name"],
-                            response=p["functionResponse"]["response"]
-                        ))
-                import vertexai.generative_models as gm
-                contents.append(gm.Content(role="user", parts=new_parts))
-            else:
-                import vertexai.generative_models as gm
-                contents.append(gm.Content(role="user", parts=[Part.from_text(message)]))
         except json.JSONDecodeError:
-            # It's a standard text prompt
-            import vertexai.generative_models as gm
+            parsed_msg = None
+
+        if isinstance(parsed_msg, list) and parsed_msg and "functionResponse" in parsed_msg[0]:
+            logger.debug(f"Appending {len(parsed_msg)} functionResponse part(s)")
+            new_parts = []
+            for p in parsed_msg:
+                fr = p["functionResponse"]
+                logger.debug(f"  functionResponse: {fr['name']} → {_truncate(fr['response'])}")
+                new_parts.append(Part.from_function_response(
+                    name=fr["name"],
+                    response=fr["response"]
+                ))
+            contents.append(gm.Content(role="user", parts=new_parts))
+        else:
+            logger.debug(f"Appending text user message: {_truncate(message)}")
             contents.append(gm.Content(role="user", parts=[Part.from_text(message)]))
 
-        # Generate the next response in the chain
-        response = model.generate_content(contents)
-        
-        # Check if the model wants to call functions
+        # ── Call the model ───────────────────────────────────────────────
+        logger.info(
+            f"Calling generate_content — agent={agent_name} "
+            f"total_turns={len(contents)} model={model_name}"
+        )
+        logger.debug(f"Full contents array ({len(contents)} items):")
+        for i, c in enumerate(contents):
+            part_summaries = []
+            for p in c.parts:
+                try:
+                    if hasattr(p, 'function_call') and p.function_call.name:
+                        part_summaries.append(f"functionCall:{p.function_call.name}")
+                    elif hasattr(p, 'text') and p.text:
+                        part_summaries.append(f"text:{_truncate(p.text, 120)}")
+                    else:
+                        part_summaries.append("(unknown part)")
+                except Exception:
+                    part_summaries.append("(unreadable part)")
+            logger.debug(f"  contents[{i}] role={c.role} parts=[{', '.join(part_summaries)}]")
+
+        t_start = time.time()
+        try:
+            response = model.generate_content(contents)
+        except Exception as exc:
+            logger.error(f"generate_content raised an exception: {exc}", exc_info=True)
+            raise
+
+        duration_ms = int((time.time() - t_start) * 1000)
+
+        # ── Log raw response ─────────────────────────────────────────────
+        logger.info(f"generate_content returned in {duration_ms}ms")
+        try:
+            finish_reason = response.candidates[0].finish_reason
+            logger.info(f"finish_reason: {finish_reason}")
+        except Exception:
+            logger.warning("Could not read finish_reason from response")
+
         fn_calls = self._extract_function_calls(response)
+        response_text = self._extract_text(response)
+
+        logger.debug(f"Extracted text ({len(response_text)} chars): {_truncate(response_text)}")
+        logger.info(f"Function calls ({len(fn_calls)}): {[c.name for c in fn_calls]}")
+        for i, c in enumerate(fn_calls):
+            args_preview = {k: _truncate(v) for k, v in c.args.items()}
+            logger.debug(f"  fn_call[{i}]: {c.name}({args_preview})")
+
+        # ── Build and return result ──────────────────────────────────────
         if fn_calls:
-            # Return the function calls to VS Code to execute
-            serialized_calls = []
-            for call in fn_calls:
-                serialized_calls.append({
-                    "name": call.name,
-                    "args": {k: v for k, v in call.args.items()}
-                })
-            
-            return {
+            serialized_calls = [
+                {"name": c.name, "args": {k: v for k, v in c.args.items()}}
+                for c in fn_calls
+            ]
+            result = {
                 "type": "function_calls",
                 "calls": serialized_calls,
-                "text": self._extract_text(response),
-                # Return the model's message exactly as generated so VS Code can append it to history
+                "text": response_text,
                 "raw_assistant_message": {
                     "role": "model",
-                    "parts": [{"text": self._extract_text(response)}] + [{"functionCall": {"name": c.name, "args": {k: v for k, v in c.args.items()}}} for c in fn_calls]
+                    "parts": [{"text": response_text}] + [
+                        {"functionCall": {"name": c.name, "args": {k: v for k, v in c.args.items()}}}
+                        for c in fn_calls
+                    ]
                 }
             }
+            logger.info(f"Returning 'function_calls' response with {len(serialized_calls)} call(s)")
         else:
-            # The model is done and returning text
-            text_response = self._extract_text(response)
-            return {
+            result = {
                 "type": "text",
-                "text": text_response,
+                "text": response_text,
                 "raw_assistant_message": {
                     "role": "model",
-                    "parts": [{"text": text_response}]
+                    "parts": [{"text": response_text}]
                 }
             }
+            logger.info(f"Returning 'text' response: {_truncate(response_text)}")
+
+        return result
+
 
 # For Vertex Agent Engine
 app = ForgeEngine()
