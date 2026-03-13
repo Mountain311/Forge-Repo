@@ -31,7 +31,6 @@ export class ForgeDashboard {
     ForgeDashboard.currentPanel = new ForgeDashboard(panel);
   }
 
-  /** Safe static helper — call from anywhere, no null-checks needed. */
   public static sendEvent(event: any) {
     if (ForgeDashboard.currentPanel) {
       try { ForgeDashboard.currentPanel._panel.webview.postMessage(event); }
@@ -48,9 +47,6 @@ export class ForgeDashboard {
     }
   }
 
-  // -----------------------------------------------------------------------
-  // HTML / CSS / JS for the webview
-  // -----------------------------------------------------------------------
   private _getHtmlForWebview(): string {
     const nonce = getNonce();
     return /* html */ `<!DOCTYPE html>
@@ -58,8 +54,7 @@ export class ForgeDashboard {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <title>Forge Pipeline</title>
 <style>
 /* ── Reset & Base ──────────────────────────────────────────────────────── */
@@ -68,33 +63,23 @@ export class ForgeDashboard {
   --bg:#0a0a12;--bg2:#111120;--glass:rgba(255,255,255,0.035);
   --border:rgba(255,255,255,0.07);--text:#e2e8f0;--text-dim:#64748b;
   --radius:14px;--transition:0.4s cubic-bezier(.4,0,.2,1);
-  /* agent accent colours */
   --c-orchestrator:#a855f7;--c-architecture:#3b82f6;--c-security:#ef4444;
   --c-dependencies:#f59e0b;--c-tdd_coder:#10b981;--c-pm_agent:#ec4899;
   --c-data_leakage:#06b6d4;--c-ethics:#8b5cf6;--c-review:#22c55e;
+  --c-recovery:#f43f5e; /* NEW: Recovery Agent Color */
 }
 html,body{height:100%;overflow:hidden}
 body{
-  background:var(--bg);
-  color:var(--text);
+  background:var(--bg); color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
-  font-size:13px;
-  display:flex;flex-direction:column;
+  font-size:13px; display:flex;flex-direction:column;
 }
 
-/* ── Header ────────────────────────────────────────────────────────────── */
-.header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:14px 20px;
-  background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(59,130,246,.06));
-  border-bottom:1px solid var(--border);
-  flex-shrink:0;
-}
+/* ── Header & Layout (Truncated for brevity, keep your existing styles) ── */
+.header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(59,130,246,.06));border-bottom:1px solid var(--border);flex-shrink:0;}
 .header-left{display:flex;align-items:center;gap:10px}
 .logo{font-size:22px}
-.header h1{font-size:15px;font-weight:700;letter-spacing:-.3px;
-  background:linear-gradient(135deg,#a855f7,#3b82f6);-webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;background-clip:text}
+.header h1{font-size:15px;font-weight:700;letter-spacing:-.3px;background:linear-gradient(135deg,#a855f7,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .subtitle{font-size:11px;color:var(--text-dim);margin-left:2px}
 .header-right{display:flex;align-items:center;gap:16px}
 .status{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
@@ -104,83 +89,29 @@ body{
 .status.complete .status-dot{background:#3b82f6}
 .status.error .status-dot{background:#ef4444;box-shadow:0 0 8px #ef4444}
 .timer{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:13px;font-weight:600;color:#a855f7;min-width:42px;text-align:right}
-
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.4}}
-
-/* ── Phase Bar ─────────────────────────────────────────────────────────── */
-.phase-bar{
-  display:flex;align-items:center;gap:0;padding:12px 20px;flex-shrink:0;
-  background:var(--bg2);border-bottom:1px solid var(--border);
-}
-.phase{
-  flex:1;display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:8px;
-  opacity:.35;transition:all var(--transition);cursor:default;
-}
+.phase-bar{display:flex;align-items:center;gap:0;padding:12px 20px;flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border);}
+.phase{flex:1;display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:8px;opacity:.35;transition:all var(--transition);cursor:default;}
 .phase.active{opacity:1;background:rgba(168,85,247,.1)}
 .phase.done{opacity:.7}
-.phase-num{
-  width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-  font-size:11px;font-weight:700;border:1.5px solid rgba(255,255,255,.15);
-  transition:all var(--transition);
-}
+.phase-num{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:1.5px solid rgba(255,255,255,.15);transition:all var(--transition);}
 .phase.active .phase-num{background:#a855f7;border-color:#a855f7;color:#fff}
 .phase.done .phase-num{background:#22c55e;border-color:#22c55e;color:#fff}
 .phase-label{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
 .phase-connector{width:24px;height:2px;background:rgba(255,255,255,.08);flex-shrink:0;transition:background var(--transition)}
 .phase-connector.lit{background:linear-gradient(90deg,#a855f7,#3b82f6)}
-
-/* ── Pipeline Area ─────────────────────────────────────────────────────── */
-.pipeline{
-  flex:1;overflow-y:auto;padding:20px;
-  display:flex;flex-direction:column;gap:12px;
-  min-height:0;
-}
-
-/* ── Orchestrator ──────────────────────────────────────────────────────── */
+.pipeline{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px;min-height:0;}
 .orchestrator-section{display:flex;justify-content:center}
-.orchestrator-card{
-  max-width:320px;width:100%;padding:14px 20px;
-  background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(99,102,241,.05));
-  border:1.5px solid rgba(168,85,247,.2);border-radius:var(--radius);
-  display:flex;align-items:center;gap:14px;transition:all var(--transition);
-  position:relative;overflow:hidden;
-}
-.orchestrator-card.active{
-  border-color:rgba(168,85,247,.6);
-  box-shadow:0 0 30px rgba(168,85,247,.15),inset 0 0 30px rgba(168,85,247,.03);
-  animation:card-glow-orch 2s ease-in-out infinite;
-}
+.orchestrator-card{max-width:320px;width:100%;padding:14px 20px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(99,102,241,.05));border:1.5px solid rgba(168,85,247,.2);border-radius:var(--radius);display:flex;align-items:center;gap:14px;transition:all var(--transition);position:relative;overflow:hidden;}
+.orchestrator-card.active{border-color:rgba(168,85,247,.6);box-shadow:0 0 30px rgba(168,85,247,.15),inset 0 0 30px rgba(168,85,247,.03);animation:card-glow-orch 2s ease-in-out infinite;}
 .orchestrator-card.done{border-color:rgba(34,197,94,.4);box-shadow:0 0 15px rgba(34,197,94,.08)}
-
 @keyframes card-glow-orch{0%,100%{box-shadow:0 0 25px rgba(168,85,247,.12)}50%{box-shadow:0 0 40px rgba(168,85,247,.22)}}
-
-/* connector line */
-.connector{width:2px;height:20px;margin:0 auto;
-  background:linear-gradient(to bottom,rgba(168,85,247,.3),rgba(168,85,247,.05));
-  transition:all var(--transition)}
+.connector{width:2px;height:20px;margin:0 auto;background:linear-gradient(to bottom,rgba(168,85,247,.3),rgba(168,85,247,.05));transition:all var(--transition)}
 .connector.lit{background:linear-gradient(to bottom,#a855f7,rgba(59,130,246,.3));height:24px}
-
-/* ── Agent Grid ────────────────────────────────────────────────────────── */
-.agent-grid{
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;
-}
-
-/* ── Agent Card ────────────────────────────────────────────────────────── */
-.agent-card{
-  background:var(--glass);border:1px solid var(--border);border-radius:var(--radius);
-  padding:14px 16px;display:flex;align-items:center;gap:12px;
-  transition:all var(--transition);position:relative;overflow:hidden;
-  opacity:.55;
-}
-.agent-card::before{
-  content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
-  background:var(--accent);opacity:.25;transition:opacity var(--transition);
-}
-.agent-card.active{
-  opacity:1;background:rgba(255,255,255,.055);border-color:var(--accent);
-  transform:translateY(-2px) scale(1.01);
-  box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 0 1px var(--accent);
-}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;}
+.agent-card{background:var(--glass);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;align-items:center;gap:12px;transition:all var(--transition);position:relative;overflow:hidden;opacity:.55;}
+.agent-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);opacity:.25;transition:opacity var(--transition);}
+.agent-card.active{opacity:1;background:rgba(255,255,255,.055);border-color:var(--accent);transform:translateY(-2px) scale(1.01);box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 0 1px var(--accent);}
 .agent-card.active::before{opacity:1}
 .agent-card.active .agent-indicator{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse-dot 1.5s infinite}
 .agent-card.done{opacity:.85;border-color:rgba(34,197,94,.3)}
@@ -189,45 +120,20 @@ body{
 .agent-card.done .agent-name::after{content:' ✓';color:#22c55e;font-size:12px}
 .agent-card.error{opacity:1;border-color:rgba(239,68,68,.4)}
 .agent-card.error::before{background:#ef4444;opacity:.8}
-
 .agent-icon{font-size:20px;flex-shrink:0;line-height:1}
 .agent-info{flex:1;min-width:0}
 .agent-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .agent-status{font-size:10px;color:var(--text-dim);margin-top:2px;transition:color var(--transition)}
 .agent-card.active .agent-status{color:var(--accent)}
 .agent-indicator{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.15);flex-shrink:0;transition:all var(--transition)}
-
-/* tool count badge */
-.tool-count{
-  position:absolute;top:6px;right:8px;font-size:9px;font-weight:700;
-  background:rgba(255,255,255,.08);border-radius:10px;padding:2px 6px;
-  color:var(--text-dim);display:none;
-}
+.tool-count{position:absolute;top:6px;right:8px;font-size:9px;font-weight:700;background:rgba(255,255,255,.08);border-radius:10px;padding:2px 6px;color:var(--text-dim);display:none;}
 .agent-card.active .tool-count,.agent-card.done .tool-count{display:block}
-
-/* ── Stats Bar ─────────────────────────────────────────────────────────── */
-.stats-bar{
-  display:flex;gap:16px;padding:10px 20px;flex-shrink:0;
-  border-top:1px solid var(--border);border-bottom:1px solid var(--border);
-  background:var(--bg2);
-}
+.stats-bar{display:flex;gap:16px;padding:10px 20px;flex-shrink:0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:var(--bg2);}
 .stat{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim)}
 .stat-val{font-weight:700;color:var(--text);font-family:'SF Mono',Menlo,monospace}
-
-/* ── Event Log ─────────────────────────────────────────────────────────── */
-.event-log{
-  flex-shrink:0;height:180px;display:flex;flex-direction:column;
-  border-top:1px solid var(--border);
-}
-.log-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:8px 16px;background:var(--bg2);border-bottom:1px solid var(--border);
-  font-size:11px;font-weight:700;color:var(--text-dim);letter-spacing:.5px;
-}
-.clear-btn{
-  background:none;border:1px solid rgba(255,255,255,.1);color:var(--text-dim);
-  font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer;transition:all .2s;
-}
+.event-log{flex-shrink:0;height:180px;display:flex;flex-direction:column;border-top:1px solid var(--border);}
+.log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--bg2);border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text-dim);letter-spacing:.5px;}
+.clear-btn{background:none;border:1px solid rgba(255,255,255,.1);color:var(--text-dim);font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer;transition:all .2s;}
 .clear-btn:hover{border-color:#a855f7;color:#a855f7}
 .log-entries{flex:1;overflow-y:auto;padding:6px 0;font-family:'SF Mono',Menlo,Consolas,monospace;font-size:11px}
 .log-entry{padding:3px 16px;border-left:2px solid transparent;transition:background .2s;white-space:pre-wrap;word-break:break-all}
@@ -239,12 +145,8 @@ body{
 .log-entry.routing{color:#3b82f6;border-left-color:#3b82f6}
 .log-entry.error{color:#ef4444;border-left-color:#ef4444}
 .log-ts{color:#475569;margin-right:8px}
-
-/* glow animation for active cards */
 @keyframes card-glow{0%,100%{box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 15px var(--glow)}50%{box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 30px var(--glow)}}
 .agent-card.active{animation:card-glow 2s ease-in-out infinite}
-
-/* scrollbar styling */
 ::-webkit-scrollbar{width:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:4px}
@@ -253,7 +155,6 @@ body{
 </head>
 <body>
 
-<!-- Header -->
 <header class="header">
   <div class="header-left">
     <span class="logo">🔮</span>
@@ -269,7 +170,6 @@ body{
   </div>
 </header>
 
-<!-- Phase Bar -->
 <div class="phase-bar">
   <div class="phase" data-phase="1"><span class="phase-num">1</span><span class="phase-label">Plan</span></div>
   <div class="phase-connector"></div>
@@ -280,9 +180,7 @@ body{
   <div class="phase" data-phase="4"><span class="phase-num">4</span><span class="phase-label">Deliver</span></div>
 </div>
 
-<!-- Pipeline -->
 <div class="pipeline">
-  <!-- Orchestrator -->
   <div class="orchestrator-section">
     <div class="orchestrator-card" id="card-orchestrator" data-agent="orchestrator">
       <span class="agent-icon">🎯</span>
@@ -297,7 +195,6 @@ body{
 
   <div class="connector" id="connector"></div>
 
-  <!-- Agent Grid -->
   <div class="agent-grid">
     <div class="agent-card" id="card-architecture" data-agent="architecture" style="--accent:var(--c-architecture);--glow:rgba(59,130,246,.2)">
       <span class="agent-icon">🏗️</span>
@@ -324,6 +221,11 @@ body{
       <div class="agent-info"><div class="agent-name">PM Agent</div><div class="agent-status" id="status-pm_agent">Idle</div></div>
       <div class="agent-indicator"></div><span class="tool-count" id="tools-pm_agent"></span>
     </div>
+    <div class="agent-card" id="card-recovery_agent" data-agent="recovery_agent" style="--accent:var(--c-recovery);--glow:rgba(244,63,94,.2)">
+      <span class="agent-icon">🚑</span>
+      <div class="agent-info"><div class="agent-name">Recovery Agent</div><div class="agent-status" id="status-recovery_agent">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-recovery_agent"></span>
+    </div>
     <div class="agent-card" id="card-data_leakage" data-agent="data_leakage" style="--accent:var(--c-data_leakage);--glow:rgba(6,182,212,.2)">
       <span class="agent-icon">🔒</span>
       <div class="agent-info"><div class="agent-name">Data Leakage</div><div class="agent-status" id="status-data_leakage">Idle</div></div>
@@ -342,14 +244,12 @@ body{
   </div>
 </div>
 
-<!-- Stats Bar -->
 <div class="stats-bar">
   <div class="stat">Agents run <span class="stat-val" id="stat-agents">0</span></div>
   <div class="stat">Tool calls <span class="stat-val" id="stat-tools">0</span></div>
   <div class="stat">Current phase <span class="stat-val" id="stat-phase">—</span></div>
 </div>
 
-<!-- Event Log -->
 <div class="event-log">
   <div class="log-header">
     <span>📋 LIVE EVENT LOG</span>
@@ -371,7 +271,8 @@ body{
         pm_agent:      { emoji: '📋', label: 'PM Agent' },
         data_leakage:  { emoji: '🔒', label: 'Data Leakage' },
         ethics:        { emoji: '⚖️', label: 'Ethics' },
-        review:        { emoji: '✅', label: 'Review' }
+        review:        { emoji: '✅', label: 'Review' },
+        recovery_agent: { emoji: '🚑', label: 'Recovery Agent' } // 🔥 NEW: Added mapping
     };
 
     var toolCounts = {};
@@ -385,12 +286,8 @@ body{
         var d = new Date();
         return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
     }
-    function getLabel(agent) {
-        return agents[agent] ? agents[agent].label : agent;
-    }
-    function getEmoji(agent) {
-        return agents[agent] ? agents[agent].emoji : '🤖';
-    }
+    function getLabel(agent) { return agents[agent] ? agents[agent].label : agent; }
+    function getEmoji(agent) { return agents[agent] ? agents[agent].emoji : '🤖'; }
 
     /* ── Timer ────────────────────────────────────────────────────────── */
     function startTimer() {
@@ -400,13 +297,10 @@ body{
             var s = Math.floor((Date.now() - startTime) / 1000);
             var m = Math.floor(s / 60);
             s = s % 60;
-            document.getElementById('timer').textContent =
-                ('0'+m).slice(-2) + ':' + ('0'+s).slice(-2);
+            document.getElementById('timer').textContent = ('0'+m).slice(-2) + ':' + ('0'+s).slice(-2);
         }, 500);
     }
-    function stopTimer() {
-        if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-    }
+    function stopTimer() { if (timerInterval) { clearInterval(timerInterval); timerInterval = null; } }
 
     /* ── Status ───────────────────────────────────────────────────────── */
     function setStatus(state, text) {
@@ -445,7 +339,6 @@ body{
         if (state === 'active') {
             agentsRunSet[agent] = true;
             document.getElementById('stat-agents').textContent = Object.keys(agentsRunSet).length;
-            // light up connector when any agent is active
             var conn = document.getElementById('connector');
             if (conn) conn.className = 'connector lit';
         }
@@ -484,7 +377,6 @@ body{
         entry.innerHTML = '<span class="log-ts">' + ts() + '</span>' + escapeHtml(message);
         container.appendChild(entry);
         container.scrollTop = container.scrollHeight;
-        // keep last 200 entries
         while (container.children.length > 200) container.removeChild(container.firstChild);
     }
     function escapeHtml(s) {
@@ -509,43 +401,35 @@ body{
                 setStatus('running', 'Running');
                 addLog('system', '🚀 Pipeline started — "' + (m.data && m.data.prompt ? m.data.prompt.slice(0,60) : '') + '"');
                 break;
-
             case 'agent_start':
                 setAgentState(m.agent, 'active');
                 addLog('info', getEmoji(m.agent) + ' ' + getLabel(m.agent) + ' started');
                 break;
-
             case 'agent_done':
                 setAgentState(m.agent, 'done');
                 addLog('success', '✓ ' + getLabel(m.agent) + ' completed');
                 break;
-
             case 'tool_call':
                 addToolCall(m.agent);
                 addLog('tool', '⚙ ' + getLabel(m.agent) + ' → ' + (m.data ? m.data.name : '?') + '()');
                 break;
-
             case 'tool_result':
                 addLog('tool', '  ← ' + (m.data ? m.data.name : '?') + ' responded');
                 break;
-
             case 'routing':
                 if (m.data && m.data.from) setAgentState(m.data.from, 'done');
                 if (m.data && m.data.to) setAgentState(m.data.to, 'active');
                 addLog('routing', '→ ' + (m.data ? m.data.from || 'start' : '?') + ' → ' + (m.data ? m.data.to || 'done' : '?'));
                 break;
-
             case 'phase_update':
                 setPhase(m.data ? m.data.phase : 0);
                 addLog('system', '📍 Phase ' + (m.data ? m.data.phase : '?') + ': ' + (m.data ? m.data.name || '' : ''));
                 break;
-
             case 'pipeline_complete':
                 stopTimer();
                 setStatus('complete', 'Complete');
                 addLog('system', '🎉 Pipeline complete');
                 break;
-
             case 'error':
                 setStatus('error', 'Error');
                 if (m.agent) setAgentState(m.agent, 'error');
