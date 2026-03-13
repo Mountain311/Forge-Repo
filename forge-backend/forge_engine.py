@@ -25,13 +25,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Logging Setup — writes structured JSON directly to Google Cloud Logging
 # so you can query it in the Cloud Console Logs Explorer.
-#
-# Filter in Logs Explorer:
-#   logName="projects/nastwest-u26wck-607/logs/forge_engine"
-#
-# To see only request/response payloads:
-#   logName="projects/nastwest-u26wck-607/logs/forge_engine"
-#   jsonPayload.event=~"REQUEST|RESPONSE"
 # ---------------------------------------------------------------------------
 try:
     import google.cloud.logging as gcloud_logging
@@ -56,8 +49,6 @@ logger.setLevel(logging.DEBUG)
 if _use_cloud_logging:
     logger.addHandler(_cloud_handler)
 
-# Structured log helper — writes a JSON payload so fields are queryable
-# in Logs Explorer (e.g. jsonPayload.agent, jsonPayload.event)
 _gcloud_logger = _gcloud_client.logger("forge_engine") if _use_cloud_logging else None
 
 def clog(event: str, severity: str = "DEBUG", **fields):
@@ -65,17 +56,14 @@ def clog(event: str, severity: str = "DEBUG", **fields):
     payload = {"event": event, **fields}
     if _gcloud_logger:
         _gcloud_logger.log_struct(payload, severity=severity)
-    # Always also print to stderr as a fallback
     print(f"[{severity}] {json.dumps(payload, default=str)}", flush=True)
 
 clog("ENGINE_INIT", severity="INFO", message="Forge Engine logging initialised")
-
 
 def _truncate(value: any, max_chars: int = 400) -> str:
     """Return a safely truncated string representation of any value."""
     s = value if isinstance(value, str) else json.dumps(value, default=str)
     return s[:max_chars] + ("…" if len(s) > max_chars else "")
-
 
 def _serialise_contents(contents: list) -> list:
     """Convert Vertex AI Content objects into plain dicts for structured logging."""
@@ -98,7 +86,6 @@ def _serialise_contents(contents: list) -> list:
                 parts.append({"type": "unreadable"})
         result.append({"role": c.role, "parts": parts})
     return result
-
 
 # ---------------------------------------------------------------------------
 # Function Declaration Schemas
@@ -187,16 +174,30 @@ search_code_func = FunctionDeclaration(
     }
 )
 
-forge_tools = Tool(function_declarations=[
-    read_file_func,
-    create_artifact_func,
-    write_code_func,
-    execute_command_func,
-    update_task_status_func,
-    list_directory_func,
-    search_code_func,
-])
+# ---------------------------------------------------------------------------
+# Dynamic Tool Loading
+# ---------------------------------------------------------------------------
 
+FUNCTION_MAP = {
+    "read_file": read_file_func,
+    "create_artifact": create_artifact_func,
+    "write_code": write_code_func,
+    "execute_command": execute_command_func,
+    "update_task_status": update_task_status_func,
+    "list_directory": list_directory_func,
+    "search_code": search_code_func,
+}
+
+def _get_tools_for_agent(agent_config: dict) -> list:
+    """Reads the 'tools' list from the YAML config and returns Vertex AI Tools."""
+    tool_names = agent_config.get("tools", [])
+    if not tool_names:
+        return None
+    
+    declarations = [FUNCTION_MAP[name] for name in tool_names if name in FUNCTION_MAP]
+    if declarations:
+        return [Tool(function_declarations=declarations)]
+    return None
 
 # ---------------------------------------------------------------------------
 # ForgeEngine
@@ -239,33 +240,12 @@ class ForgeEngine:
         message: str = None,
         chat_history: list = None,
     ) -> dict:
-        """Public entrypoint. Multiplexes all agent tasks."""
-        # Log the full incoming request so it appears in Cloud Logging
-        clog("INCOMING_REQUEST", severity="INFO",
-             agent=agent_name,
-             prompt=prompt,
-             context=context,
-             message=message,
-             history_len=len(chat_history) if chat_history else 0,
-             chat_history=chat_history)
-
         self._ensure_initialized()
-
-        # Orchestrator always runs fully server-side to avoid Gemini blocking
-        # text output when tools are active
-        if agent_name == "orchestrator" and message is None:
-            initial_prompt = (
-                f"User Request: {prompt}\n"
-                f"Code Context:\n{context}\n\n"
-                f"Please determine the next routing step."
-            )
-            return self._run_orchestrator(initial_prompt)
 
         if message is not None:
             return self._send_message_to_agent(agent_name, message, chat_history)
 
         initial_prompt = prompt
-        logger.info(f"Fresh start for agent '{agent_name}'")
         return self._send_message_to_agent(agent_name, initial_prompt, [])
 
     # ------------------------------------------------------------------
@@ -274,10 +254,14 @@ class ForgeEngine:
         calls = []
         try:
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'function_call') and part.function_call.name:
-                    calls.append(part.function_call)
-        except (IndexError, AttributeError) as e:
-            logger.warning(f"_extract_function_calls: {e}")
+                try:
+                    # In the Vertex SDK, accessing this raises an exception if it doesn't exist
+                    if part.function_call:
+                        calls.append(part.function_call)
+                except Exception:
+                    pass # Not a function call part, move on safely
+        except Exception as e:
+            logger.warning(f"_extract_function_calls error: {e}")
         return calls
 
     @staticmethod
@@ -286,112 +270,13 @@ class ForgeEngine:
         try:
             for part in response.candidates[0].content.parts:
                 try:
-                    if hasattr(part, 'function_call') and part.function_call.name:
-                        continue
-                    if hasattr(part, 'text') and part.text:
-                        text += part.text + "\n"
-                except AttributeError:
-                    pass
-        except IndexError as e:
-            logger.warning(f"_extract_text: {e}")
+                    # Accessing .text raises an exception if it's a function call part
+                    text += part.text + "\n"
+                except Exception:
+                    pass # Not a text part, move on safely
+        except Exception as e:
+            logger.warning(f"_extract_text error: {e}")
         return text.strip()
-
-    # ------------------------------------------------------------------
-    def _run_orchestrator(self, prompt: str) -> dict:
-        """
-        Runs the orchestrator entirely server-side.
-        Tool calls (list_directory, read_file) are executed here using tools.py,
-        then the model is called a final time with tool_config=NONE to force
-        plain JSON output — avoiding the Gemini issue where tools=active blocks
-        text responses.
-        """
-        from vertexai.generative_models import ToolConfig
-        import vertexai.generative_models as gm
-
-        self._ensure_initialized()
-        config = self.configs["orchestrator"]
-        model_name = config["model"]
-
-        model = GenerativeModel(
-            model_name,
-            system_instruction=config["instructions"],
-            tools=[forge_tools]
-        )
-
-        contents = [gm.Content(role="user", parts=[Part.from_text(prompt)])]
-        MAX_TOOL_ROUNDS = 5
-
-        for round_num in range(MAX_TOOL_ROUNDS):
-            clog("ORCHESTRATOR_TOOL_ROUND", severity="INFO",
-                 round=round_num, num_turns=len(contents))
-
-            response = model.generate_content(
-                contents,
-                generation_config={"temperature": 0},
-            )
-            fn_calls = self._extract_function_calls(response)
-
-            if not fn_calls:
-                # Model returned text — shouldn't happen mid-loop but handle it
-                break
-
-            # Append model turn
-            model_parts = []
-            text = self._extract_text(response)
-            if text:
-                model_parts.append(Part.from_text(text))
-            for c in fn_calls:
-                model_parts.append(Part.from_dict({"function_call": {
-                    "name": c.name,
-                    "args": {k: v for k, v in c.args.items()}
-                }}))
-            contents.append(gm.Content(role="model", parts=model_parts))
-
-            # Execute tools server-side
-            from tools import tool_map
-            response_parts = []
-            for c in fn_calls:
-                tool_fn = tool_map.get(c.name)
-                if tool_fn:
-                    try:
-                        result = tool_fn(**{k: v for k, v in c.args.items()})
-                    except Exception as e:
-                        result = f"Tool error: {e}"
-                else:
-                    result = f"Unknown tool: {c.name}"
-                clog("ORCHESTRATOR_TOOL_RESULT", severity="DEBUG",
-                     tool=c.name, result=str(result)[:300])
-                response_parts.append(Part.from_function_response(
-                    name=c.name, response={"content": result}
-                ))
-            contents.append(gm.Content(role="user", parts=response_parts))
-
-        # Final call with tool_config=NONE to force plain JSON text output
-        clog("ORCHESTRATOR_FINAL_CALL", severity="INFO",
-             num_turns=len(contents))
-
-        final_model = GenerativeModel(
-            model_name,
-            system_instruction=config["instructions"],
-            tools=[forge_tools],
-            tool_config=ToolConfig(
-                function_calling_config=ToolConfig.FunctionCallingConfig(
-                    mode=ToolConfig.FunctionCallingConfig.Mode.NONE
-                )
-            )
-        )
-        final_response = final_model.generate_content(
-            contents,
-            generation_config={"temperature": 0},
-        )
-        text = self._extract_text(final_response)
-        clog("ORCHESTRATOR_FINAL_RESPONSE", severity="INFO", text=text)
-
-        return {
-            "type": "text",
-            "text": text,
-            "raw_assistant_message": {"role": "model", "parts": [{"text": text}]}
-        }
 
     # ------------------------------------------------------------------
     def _send_message_to_agent(
@@ -411,10 +296,11 @@ class ForgeEngine:
         model_name = config["model"]
         logger.info(f"_send_message_to_agent — agent={agent_name} model={model_name}")
 
+        agent_tools = _get_tools_for_agent(config)
         model = GenerativeModel(
             model_name,
             system_instruction=config["instructions"],
-            tools=[forge_tools]
+            tools=agent_tools
         )
 
         # ── Reconstruct history ──────────────────────────────────────────
@@ -465,22 +351,7 @@ class ForgeEngine:
             f"Calling generate_content — agent={agent_name} "
             f"total_turns={len(contents)} model={model_name}"
         )
-        logger.debug(f"Full contents array ({len(contents)} items):")
-        for i, c in enumerate(contents):
-            part_summaries = []
-            for p in c.parts:
-                try:
-                    if hasattr(p, 'function_call') and p.function_call.name:
-                        part_summaries.append(f"functionCall:{p.function_call.name}")
-                    elif hasattr(p, 'text') and p.text:
-                        part_summaries.append(f"text:{_truncate(p.text, 120)}")
-                    else:
-                        part_summaries.append("(unknown part)")
-                except Exception:
-                    part_summaries.append("(unreadable part)")
-            logger.debug(f"  contents[{i}] role={c.role} parts=[{', '.join(part_summaries)}]")
 
-        # Log EXACTLY what is being sent to the model
         clog("GENERATE_CONTENT_REQUEST", severity="INFO",
              agent=agent_name,
              model=model_name,
@@ -505,7 +376,6 @@ class ForgeEngine:
         except Exception:
             finish_reason = "unknown"
 
-        # Log EXACTLY what came back from the model
         clog("GENERATE_CONTENT_RESPONSE", severity="INFO",
              agent=agent_name,
              model=model_name,
@@ -523,16 +393,21 @@ class ForgeEngine:
                 {"name": c.name, "args": {k: v for k, v in c.args.items()}}
                 for c in fn_calls
             ]
+            
+            # Safely build parts list without pushing empty strings
+            parts = []
+            if response_text:
+                parts.append({"text": response_text})
+            for c in fn_calls:
+                parts.append({"functionCall": {"name": c.name, "args": {k: v for k, v in c.args.items()}}})
+                
             result = {
                 "type": "function_calls",
                 "calls": serialized_calls,
                 "text": response_text,
                 "raw_assistant_message": {
                     "role": "model",
-                    "parts": [{"text": response_text}] + [
-                        {"functionCall": {"name": c.name, "args": {k: v for k, v in c.args.items()}}}
-                        for c in fn_calls
-                    ]
+                    "parts": parts
                 }
             }
         else:
@@ -541,11 +416,10 @@ class ForgeEngine:
                 "text": response_text,
                 "raw_assistant_message": {
                     "role": "model",
-                    "parts": [{"text": response_text}]
+                    "parts": [{"text": response_text}] if response_text else []
                 }
             }
 
-        # Log the full response being returned to the VS Code extension
         clog("OUTGOING_RESPONSE", severity="INFO",
              agent=agent_name,
              result_type=result["type"],
@@ -553,7 +427,6 @@ class ForgeEngine:
              function_calls=result.get("calls", []))
 
         return result
-
 
 # For Vertex Agent Engine
 app = ForgeEngine()

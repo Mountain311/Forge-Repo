@@ -235,11 +235,12 @@ export function activate(context: vscode.ExtensionContext) {
             const client = await auth.getClient();
 
             const location = "us-central1";
-            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/6768680442007650304";
+            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/898238327730208768";
             const url = `https://${location}-aiplatform.googleapis.com/v1beta1/${endpointId}:query`;
 
-            let currentAgent: string | null = "orchestrator";
-            let currentPrompt: string | null = userPrompt;
+            // CHANGED: Start with workspace_analyzer instead of orchestrator
+            let currentAgent: string | null = "workspace_analyzer";
+            let currentPrompt: string | null = `Please analyze the current directory and Task_list.md and provide a state summary for the Orchestrator regarding this new user request: "${userPrompt}"`;
             let dagState: any = {};
             const globalExecutionLog: string[] = [];
 
@@ -360,21 +361,31 @@ export function activate(context: vscode.ExtensionContext) {
 
                         log('DEBUG', `  Text response from "${currentAgent}":`, text.slice(0, 400));
 
-                        if (currentAgent !== "orchestrator") {
-                            stream.markdown(`${text}\n\n`);
-
-                            logAgentRouting(currentAgent, "orchestrator", "agent finished, returning to orchestrator");
+                        // CHANGED: Implementing the 3-step routing logic
+                        if (currentAgent === "workspace_analyzer") {
+                            // Analyzer finished reading the workspace. Pass its report to the orchestrator.
+                            logAgentRouting(currentAgent, "orchestrator", "analyzer finished, passing state to orchestrator");
                             currentAgent = "orchestrator";
-                            currentPrompt = `Agent just finished its work and returned this text: "${text}".\n\nPlease check .forge/Task_list.md and determine next routing step.`;
+                            currentPrompt = `Workspace State Report:\n${text}\n\nProvide the STRICT JSON routing response.`;
                             isFinished = true;
                             continue;
                         }
-
-                        if (currentAgent === "orchestrator") {
+                        else if (currentAgent === "orchestrator") {
+                            // Orchestrator gave us JSON. Parse and route to the next worker agent.
                             try {
-                                const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
-                                log('DEBUG', 'Parsing orchestrator JSON:', cleaned.slice(0, 500));
-                                dagState = JSON.parse(cleaned);
+                                // 1. Surgically extract the JSON object using bracket positions
+                                const startIndex = text.indexOf('{');
+                                const endIndex = text.lastIndexOf('}');
+
+                                if (startIndex === -1 || endIndex === -1) {
+                                    throw new Error("No JSON object found in the response text.");
+                                }
+
+                                const jsonString = text.substring(startIndex, endIndex + 1);
+                                log('DEBUG', 'Parsing orchestrator JSON:', jsonString);
+
+                                // 2. Parse the isolated string
+                                dagState = JSON.parse(jsonString);
 
                                 log('INFO', 'DAG State:', dagState);
 
@@ -393,20 +404,27 @@ export function activate(context: vscode.ExtensionContext) {
                                 }
                                 isFinished = true;
                                 continue;
-                            } catch (e) {
-                                log('WARN', 'Failed to parse orchestrator JSON:', e);
-                                nextMessageContent = "Please output the DAG state as valid strict JSON only. Do not wrap it in text.";
+                            } catch (e: any) {
+                                log('WARN', `Failed to parse orchestrator JSON: ${e.message}. Raw text was:`, text.slice(0, 200));
+                                nextMessageContent = "Your previous output failed to parse. You MUST output ONLY valid JSON starting with '{' and ending with '}'. Do not include any other text, markdown, or explanation.";
                             }
+                        }
+                        else {
+                            // A worker agent (pm_agent, tdd_coder) just finished.
+                            stream.markdown(`${text}\n\n`);
+
+                            // We MUST route back to workspace_analyzer so the orchestrator gets fresh eyes!
+                            logAgentRouting(currentAgent, "workspace_analyzer", "worker finished, scanning new workspace state");
+                            currentAgent = "workspace_analyzer";
+                            currentPrompt = `The agent just finished its work and returned: "${text}".\n\nPlease analyze the current directory and Task_list.md and provide a state summary.`;
+                            isFinished = true;
+                            continue;
                         }
                     }
 
                     if (isFinished) break;
 
                     if (nextMessageContent) {
-                        // If nextMessageContent is JSON function responses, store them
-                        // as proper functionResponse parts in history (not as a text part).
-                        // This is critical — the model needs to see the correct conversation
-                        // structure or it will return empty responses.
                         try {
                             const parsed = JSON.parse(nextMessageContent);
                             if (Array.isArray(parsed) && parsed[0]?.functionResponse) {

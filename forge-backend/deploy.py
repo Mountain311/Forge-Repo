@@ -16,7 +16,7 @@ print("Forging the Backend Endpoint on Vertex AI...")
 remote_agent = reasoning_engines.ReasoningEngine.create(
     reasoning_engine=app,
     requirements=["pyyaml", "google-cloud-aiplatform", "python-dotenv"],
-    extra_packages=["agent_configs", "tools.py", "forge_engine.py"], 
+    extra_packages=["agent_configs", "forge_engine.py"], 
     display_name="Forge-Milestone-1"
 )
 
