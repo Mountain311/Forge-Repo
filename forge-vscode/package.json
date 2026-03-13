@@ -48,7 +48,7 @@
         },
         "forge.endpointId": {
           "type": "string",
-          "default": "projects/718442730167/locations/us-central1/reasoningEngines/1510305664587530240",
+          "default": "projects/718442730167/locations/us-central1/reasoningEngines/1161839643419738112",
           "description": "The full Resource Name ID of your deployed Vertex AI Reasoning Engine."
         },
         "forge.maxOrchestratorRetries": {

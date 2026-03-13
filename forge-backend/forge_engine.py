@@ -198,10 +198,6 @@ update_context_func = FunctionDeclaration(
     }
 )
 
-# ---------------------------------------------------------------------------
-# Dynamic Tool Loading
-# ---------------------------------------------------------------------------
-
 FUNCTION_MAP = {
     "read_file": read_file_func,
     "create_artifact": create_artifact_func,
@@ -210,8 +206,8 @@ FUNCTION_MAP = {
     "update_task_status": update_task_status_func,
     "list_directory": list_directory_func,
     "search_code": search_code_func,
-    "read_context": read_context_func,       # <-- ADDED THIS
-    "update_context": update_context_func,   # <-- ADDED THIS
+    "read_context": read_context_func,
+    "update_context": update_context_func,
 }
 
 def _get_tools_for_agent(agent_config: dict) -> list:
@@ -233,26 +229,27 @@ class ForgeEngine:
     def __init__(self):
         self.configs = {}
         self._initialized = False
+        
+        # 🔥 NEW: Bake configs into memory AT DEPLOYMENT TIME
+        config_dir = Path(__file__).parent / "agent_configs"
+        if not config_dir.exists():
+            config_dir = Path("agent_configs")
+        
+        logger.info(f"Baking agent configs into memory from: {config_dir}")
+        if config_dir.exists():
+            for config_file in config_dir.glob("*.yaml"):
+                with open(config_file, "r") as f:
+                    self.configs[config_file.stem] = yaml.safe_load(f)
+                logger.info(f"  Loaded into memory: {config_file.stem}")
 
     def _ensure_initialized(self):
         if self._initialized:
             return
-        logger.info("Initialising Forge Engine…")
+        logger.info("Initialising Forge Engine Cloud Dependencies…")
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "nastwest-u26wck-607")
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
         logger.info(f"Vertex AI project={project} location={location}")
         vertexai.init(project=project, location=location)
-
-        config_dir = Path(__file__).parent / "agent_configs"
-        if not config_dir.exists():
-            config_dir = Path("agent_configs")
-        logger.info(f"Loading agent configs from: {config_dir}")
-        for config_file in config_dir.glob("*.yaml"):
-            with open(config_file, "r") as f:
-                config = yaml.safe_load(f)
-            agent_name = config_file.stem
-            self.configs[agent_name] = config
-            logger.info(f"  Loaded config: {agent_name} (model={config.get('model', '?')})")
 
         self._initialized = True
         logger.info("Forge Engine initialised successfully.")
@@ -281,11 +278,10 @@ class ForgeEngine:
         try:
             for part in response.candidates[0].content.parts:
                 try:
-                    # In the Vertex SDK, accessing this raises an exception if it doesn't exist
                     if part.function_call:
                         calls.append(part.function_call)
                 except Exception:
-                    pass # Not a function call part, move on safely
+                    pass
         except Exception as e:
             logger.warning(f"_extract_function_calls error: {e}")
         return calls
@@ -296,10 +292,9 @@ class ForgeEngine:
         try:
             for part in response.candidates[0].content.parts:
                 try:
-                    # Accessing .text raises an exception if it's a function call part
                     text += part.text + "\n"
                 except Exception:
-                    pass # Not a text part, move on safely
+                    pass 
         except Exception as e:
             logger.warning(f"_extract_text error: {e}")
         return text.strip()
@@ -329,7 +324,6 @@ class ForgeEngine:
             tools=agent_tools
         )
 
-        # ── Reconstruct history ──────────────────────────────────────────
         import vertexai.generative_models as gm
         contents = []
 
@@ -349,9 +343,7 @@ class ForgeEngine:
                             response=p["functionResponse"]["response"]
                         ))
                 contents.append(gm.Content(role=role, parts=parts))
-                logger.debug(f"  History[{idx}] role={role} parts={len(parts)}")
 
-        # ── Append new user message ──────────────────────────────────────
         try:
             parsed_msg = json.loads(message)
         except json.JSONDecodeError:
@@ -362,7 +354,6 @@ class ForgeEngine:
             new_parts = []
             for p in parsed_msg:
                 fr = p["functionResponse"]
-                logger.debug(f"  functionResponse: {fr['name']} → {_truncate(fr['response'])}")
                 new_parts.append(Part.from_function_response(
                     name=fr["name"],
                     response=fr["response"]
@@ -372,7 +363,6 @@ class ForgeEngine:
             logger.debug(f"Appending text user message: {_truncate(message)}")
             contents.append(gm.Content(role="user", parts=[Part.from_text(message)]))
 
-        # ── Call the model ───────────────────────────────────────────────
         logger.info(
             f"Calling generate_content — agent={agent_name} "
             f"total_turns={len(contents)} model={model_name}"
@@ -413,14 +403,12 @@ class ForgeEngine:
                  for c in fn_calls
              ])
 
-        # ── Build and return result ──────────────────────────────────────
         if fn_calls:
             serialized_calls = [
                 {"name": c.name, "args": {k: v for k, v in c.args.items()}}
                 for c in fn_calls
             ]
             
-            # Safely build parts list without pushing empty strings
             parts = []
             if response_text:
                 parts.append({"text": response_text})

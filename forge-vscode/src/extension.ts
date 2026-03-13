@@ -1,556 +1,454 @@
 import * as vscode from 'vscode';
-import { GoogleAuth } from 'google-auth-library';
-import * as fs from 'fs';
-import * as path from 'path';
-import { exec } from 'child_process';
-
-// Ensure you have this import for the dashboard!
-import { ForgeDashboard } from './dashboard';
 
 // ---------------------------------------------------------------------------
-// Forge Logger — writes to VS Code Output Channel "Forge Debug"
+// ForgeDashboard — VS Code Webview Panel for pipeline visualisation
 // ---------------------------------------------------------------------------
-let forgeOutputChannel: vscode.OutputChannel;
+export class ForgeDashboard {
+    public static currentPanel: ForgeDashboard | undefined;
+    private static readonly viewType = 'forgeDashboard';
+    private readonly _panel: vscode.WebviewPanel;
+    private _disposables: vscode.Disposable[] = [];
 
-function getLogger(): vscode.OutputChannel {
-    if (!forgeOutputChannel) {
-        forgeOutputChannel = vscode.window.createOutputChannel('Forge Debug');
+    private constructor(panel: vscode.WebviewPanel) {
+        this._panel = panel;
+        this._panel.webview.html = this._getHtmlForWebview();
+        this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+        this._panel.iconPath = undefined;
     }
-    return forgeOutputChannel;
+
+    public static createOrShow() {
+        const column = vscode.ViewColumn.Beside;
+        if (ForgeDashboard.currentPanel) {
+            ForgeDashboard.currentPanel._panel.reveal(column);
+            return;
+        }
+        const panel = vscode.window.createWebviewPanel(
+            ForgeDashboard.viewType,
+            '🔮 Forge Pipeline',
+            column,
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+        ForgeDashboard.currentPanel = new ForgeDashboard(panel);
+    }
+
+    public static sendEvent(event: any) {
+        if (ForgeDashboard.currentPanel) {
+            try { ForgeDashboard.currentPanel._panel.webview.postMessage(event); }
+            catch (_) { /* panel may have been disposed */ }
+        }
+    }
+
+    public dispose() {
+        ForgeDashboard.currentPanel = undefined;
+        this._panel.dispose();
+        while (this._disposables.length) {
+            const d = this._disposables.pop();
+            if (d) { d.dispose(); }
+        }
+    }
+
+    private _getHtmlForWebview(): string {
+        const nonce = getNonce();
+        return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<title>Forge Pipeline</title>
+<style>
+/* ── Reset & Base ──────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0a12;--bg2:#111120;--glass:rgba(255,255,255,0.035);
+  --border:rgba(255,255,255,0.07);--text:#e2e8f0;--text-dim:#64748b;
+  --radius:14px;--transition:0.4s cubic-bezier(.4,0,.2,1);
+  --c-orchestrator:#a855f7;--c-architecture:#3b82f6;--c-security:#ef4444;
+  --c-dependencies:#f59e0b;--c-tdd_coder:#10b981;--c-pm_agent:#ec4899;
+  --c-data_leakage:#06b6d4;--c-ethics:#8b5cf6;--c-review:#22c55e;
+  --c-recovery:#f43f5e; /* NEW: Recovery Agent Color */
+}
+html,body{height:100%;overflow:hidden}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
+  font-size:13px; display:flex;flex-direction:column;
 }
 
-function log(level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', ...parts: any[]) {
-    const ts = new Date().toISOString();
-    const msg = parts.map(p => (typeof p === 'object' ? JSON.stringify(p, null, 2) : String(p))).join(' ');
-    getLogger().appendLine(`[${ts}] [${level}] ${msg}`);
-}
+/* ── Header & Layout (Truncated for brevity, keep your existing styles) ── */
+.header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(59,130,246,.06));border-bottom:1px solid var(--border);flex-shrink:0;}
+.header-left{display:flex;align-items:center;gap:10px}
+.logo{font-size:22px}
+.header h1{font-size:15px;font-weight:700;letter-spacing:-.3px;background:linear-gradient(135deg,#a855f7,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.subtitle{font-size:11px;color:var(--text-dim);margin-left:2px}
+.header-right{display:flex;align-items:center;gap:16px}
+.status{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.status.idle .status-dot{background:#64748b}
+.status.running .status-dot{background:#22c55e;box-shadow:0 0 8px #22c55e;animation:pulse-dot 1.5s infinite}
+.status.complete .status-dot{background:#3b82f6}
+.status.error .status-dot{background:#ef4444;box-shadow:0 0 8px #ef4444}
+.timer{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:13px;font-weight:600;color:#a855f7;min-width:42px;text-align:right}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.4}}
+.phase-bar{display:flex;align-items:center;gap:0;padding:12px 20px;flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border);}
+.phase{flex:1;display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:8px;opacity:.35;transition:all var(--transition);cursor:default;}
+.phase.active{opacity:1;background:rgba(168,85,247,.1)}
+.phase.done{opacity:.7}
+.phase-num{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:1.5px solid rgba(255,255,255,.15);transition:all var(--transition);}
+.phase.active .phase-num{background:#a855f7;border-color:#a855f7;color:#fff}
+.phase.done .phase-num{background:#22c55e;border-color:#22c55e;color:#fff}
+.phase-label{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.phase-connector{width:24px;height:2px;background:rgba(255,255,255,.08);flex-shrink:0;transition:background var(--transition)}
+.phase-connector.lit{background:linear-gradient(90deg,#a855f7,#3b82f6)}
+.pipeline{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px;min-height:0;}
+.orchestrator-section{display:flex;justify-content:center}
+.orchestrator-card{max-width:320px;width:100%;padding:14px 20px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(99,102,241,.05));border:1.5px solid rgba(168,85,247,.2);border-radius:var(--radius);display:flex;align-items:center;gap:14px;transition:all var(--transition);position:relative;overflow:hidden;}
+.orchestrator-card.active{border-color:rgba(168,85,247,.6);box-shadow:0 0 30px rgba(168,85,247,.15),inset 0 0 30px rgba(168,85,247,.03);animation:card-glow-orch 2s ease-in-out infinite;}
+.orchestrator-card.done{border-color:rgba(34,197,94,.4);box-shadow:0 0 15px rgba(34,197,94,.08)}
+@keyframes card-glow-orch{0%,100%{box-shadow:0 0 25px rgba(168,85,247,.12)}50%{box-shadow:0 0 40px rgba(168,85,247,.22)}}
+.connector{width:2px;height:20px;margin:0 auto;background:linear-gradient(to bottom,rgba(168,85,247,.3),rgba(168,85,247,.05));transition:all var(--transition)}
+.connector.lit{background:linear-gradient(to bottom,#a855f7,rgba(59,130,246,.3));height:24px}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;}
+.agent-card{background:var(--glass);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;align-items:center;gap:12px;transition:all var(--transition);position:relative;overflow:hidden;opacity:.55;}
+.agent-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);opacity:.25;transition:opacity var(--transition);}
+.agent-card.active{opacity:1;background:rgba(255,255,255,.055);border-color:var(--accent);transform:translateY(-2px) scale(1.01);box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 0 1px var(--accent);}
+.agent-card.active::before{opacity:1}
+.agent-card.active .agent-indicator{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse-dot 1.5s infinite}
+.agent-card.done{opacity:.85;border-color:rgba(34,197,94,.3)}
+.agent-card.done::before{background:#22c55e;opacity:.6}
+.agent-card.done .agent-indicator{background:#22c55e}
+.agent-card.done .agent-name::after{content:' ✓';color:#22c55e;font-size:12px}
+.agent-card.error{opacity:1;border-color:rgba(239,68,68,.4)}
+.agent-card.error::before{background:#ef4444;opacity:.8}
+.agent-icon{font-size:20px;flex-shrink:0;line-height:1}
+.agent-info{flex:1;min-width:0}
+.agent-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-status{font-size:10px;color:var(--text-dim);margin-top:2px;transition:color var(--transition)}
+.agent-card.active .agent-status{color:var(--accent)}
+.agent-indicator{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.15);flex-shrink:0;transition:all var(--transition)}
+.tool-count{position:absolute;top:6px;right:8px;font-size:9px;font-weight:700;background:rgba(255,255,255,.08);border-radius:10px;padding:2px 6px;color:var(--text-dim);display:none;}
+.agent-card.active .tool-count,.agent-card.done .tool-count{display:block}
+.stats-bar{display:flex;gap:16px;padding:10px 20px;flex-shrink:0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:var(--bg2);}
+.stat{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim)}
+.stat-val{font-weight:700;color:var(--text);font-family:'SF Mono',Menlo,monospace}
+.event-log{flex-shrink:0;height:180px;display:flex;flex-direction:column;border-top:1px solid var(--border);}
+.log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--bg2);border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text-dim);letter-spacing:.5px;}
+.clear-btn{background:none;border:1px solid rgba(255,255,255,.1);color:var(--text-dim);font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer;transition:all .2s;}
+.clear-btn:hover{border-color:#a855f7;color:#a855f7}
+.log-entries{flex:1;overflow-y:auto;padding:6px 0;font-family:'SF Mono',Menlo,Consolas,monospace;font-size:11px}
+.log-entry{padding:3px 16px;border-left:2px solid transparent;transition:background .2s;white-space:pre-wrap;word-break:break-all}
+.log-entry:hover{background:rgba(255,255,255,.02)}
+.log-entry.system{color:#8b5cf6;border-left-color:#8b5cf6}
+.log-entry.info{color:#94a3b8}
+.log-entry.success{color:#22c55e;border-left-color:#22c55e}
+.log-entry.tool{color:#f59e0b;border-left-color:#f59e0b}
+.log-entry.routing{color:#3b82f6;border-left-color:#3b82f6}
+.log-entry.error{color:#ef4444;border-left-color:#ef4444}
+.log-ts{color:#475569;margin-right:8px}
+@keyframes card-glow{0%,100%{box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 15px var(--glow)}50%{box-shadow:0 8px 24px rgba(0,0,0,.25),0 0 30px var(--glow)}}
+.agent-card.active{animation:card-glow 2s ease-in-out infinite}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
+</style>
+</head>
+<body>
 
-function logSeparator(label: string) {
-    getLogger().appendLine(`\n${'='.repeat(80)}`);
-    getLogger().appendLine(`  ${label}`);
-    getLogger().appendLine('='.repeat(80));
-}
+<header class="header">
+  <div class="header-left">
+    <span class="logo">🔮</span>
+    <h1>GuardianCoder</h1>
+    <span class="subtitle">Pipeline Dashboard</span>
+  </div>
+  <div class="header-right">
+    <span id="status" class="status idle">
+      <span class="status-dot"></span>
+      <span id="status-text">Waiting</span>
+    </span>
+    <span id="timer" class="timer">00:00</span>
+  </div>
+</header>
 
-function logApiRequest(url: string, data: any) {
-    logSeparator('API REQUEST');
-    log('DEBUG', `URL: ${url}`);
-    log('DEBUG', 'Payload:', data);
-}
+<div class="phase-bar">
+  <div class="phase" data-phase="1"><span class="phase-num">1</span><span class="phase-label">Plan</span></div>
+  <div class="phase-connector"></div>
+  <div class="phase" data-phase="2"><span class="phase-num">2</span><span class="phase-label">Build</span></div>
+  <div class="phase-connector"></div>
+  <div class="phase" data-phase="3"><span class="phase-num">3</span><span class="phase-label">Validate</span></div>
+  <div class="phase-connector"></div>
+  <div class="phase" data-phase="4"><span class="phase-num">4</span><span class="phase-label">Deliver</span></div>
+</div>
 
-function summariseRawAssistantMessage(response: any) {
-    const raw = response?.raw_assistant_message;
-    const parts = raw?.parts ?? [];
-    const textParts = parts.filter((p: any) => p?.text !== undefined);
-    const functionCallParts = parts.filter((p: any) => p?.functionCall);
+<div class="pipeline">
+  <div class="orchestrator-section">
+    <div class="orchestrator-card" id="card-orchestrator" data-agent="orchestrator">
+      <span class="agent-icon">🎯</span>
+      <div class="agent-info">
+        <div class="agent-name">Orchestrator</div>
+        <div class="agent-status" id="status-orchestrator">Idle</div>
+      </div>
+      <div class="agent-indicator"></div>
+      <span class="tool-count" id="tools-orchestrator"></span>
+    </div>
+  </div>
 
-    return {
-        hasRawAssistantMessage: !!raw,
-        role: raw?.role ?? 'unknown',
-        partCount: parts.length,
-        textPartCount: textParts.length,
-        functionCallPartCount: functionCallParts.length,
-        textLengths: textParts.map((p: any) => (p.text ?? '').length),
-        hasNonEmptyTextPart: textParts.some((p: any) => (p.text ?? '').trim().length > 0),
-        responseTextLength: (response?.text ?? '').length,
+  <div class="connector" id="connector"></div>
+
+  <div class="agent-grid">
+    <div class="agent-card" id="card-architecture" data-agent="architecture" style="--accent:var(--c-architecture);--glow:rgba(59,130,246,.2)">
+      <span class="agent-icon">🏗️</span>
+      <div class="agent-info"><div class="agent-name">Architecture</div><div class="agent-status" id="status-architecture">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-architecture"></span>
+    </div>
+    <div class="agent-card" id="card-security" data-agent="security" style="--accent:var(--c-security);--glow:rgba(239,68,68,.2)">
+      <span class="agent-icon">🛡️</span>
+      <div class="agent-info"><div class="agent-name">Security</div><div class="agent-status" id="status-security">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-security"></span>
+    </div>
+    <div class="agent-card" id="card-dependencies" data-agent="dependencies" style="--accent:var(--c-dependencies);--glow:rgba(245,158,11,.2)">
+      <span class="agent-icon">📦</span>
+      <div class="agent-info"><div class="agent-name">Dependencies</div><div class="agent-status" id="status-dependencies">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-dependencies"></span>
+    </div>
+    <div class="agent-card" id="card-tdd_coder" data-agent="tdd_coder" style="--accent:var(--c-tdd_coder);--glow:rgba(16,185,129,.2)">
+      <span class="agent-icon">🧪</span>
+      <div class="agent-info"><div class="agent-name">TDD Coder</div><div class="agent-status" id="status-tdd_coder">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-tdd_coder"></span>
+    </div>
+    <div class="agent-card" id="card-pm_agent" data-agent="pm_agent" style="--accent:var(--c-pm_agent);--glow:rgba(236,72,153,.2)">
+      <span class="agent-icon">📋</span>
+      <div class="agent-info"><div class="agent-name">PM Agent</div><div class="agent-status" id="status-pm_agent">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-pm_agent"></span>
+    </div>
+    <div class="agent-card" id="card-recovery_agent" data-agent="recovery_agent" style="--accent:var(--c-recovery);--glow:rgba(244,63,94,.2)">
+      <span class="agent-icon">🚑</span>
+      <div class="agent-info"><div class="agent-name">Recovery Agent</div><div class="agent-status" id="status-recovery_agent">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-recovery_agent"></span>
+    </div>
+    <div class="agent-card" id="card-data_leakage" data-agent="data_leakage" style="--accent:var(--c-data_leakage);--glow:rgba(6,182,212,.2)">
+      <span class="agent-icon">🔒</span>
+      <div class="agent-info"><div class="agent-name">Data Leakage</div><div class="agent-status" id="status-data_leakage">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-data_leakage"></span>
+    </div>
+    <div class="agent-card" id="card-ethics" data-agent="ethics" style="--accent:var(--c-ethics);--glow:rgba(139,92,246,.2)">
+      <span class="agent-icon">⚖️</span>
+      <div class="agent-info"><div class="agent-name">Ethics</div><div class="agent-status" id="status-ethics">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-ethics"></span>
+    </div>
+    <div class="agent-card" id="card-review" data-agent="review" style="--accent:var(--c-review);--glow:rgba(34,197,94,.2)">
+      <span class="agent-icon">✅</span>
+      <div class="agent-info"><div class="agent-name">Review</div><div class="agent-status" id="status-review">Idle</div></div>
+      <div class="agent-indicator"></div><span class="tool-count" id="tools-review"></span>
+    </div>
+  </div>
+</div>
+
+<div class="stats-bar">
+  <div class="stat">Agents run <span class="stat-val" id="stat-agents">0</span></div>
+  <div class="stat">Tool calls <span class="stat-val" id="stat-tools">0</span></div>
+  <div class="stat">Current phase <span class="stat-val" id="stat-phase">—</span></div>
+</div>
+
+<div class="event-log">
+  <div class="log-header">
+    <span>📋 LIVE EVENT LOG</span>
+    <button class="clear-btn" id="clear-log">Clear</button>
+  </div>
+  <div class="log-entries" id="log-entries">
+    <div class="log-entry system"><span class="log-ts">--:--:--</span>Dashboard ready. Waiting for pipeline\u2026</div>
+  </div>
+</div>
+
+<script nonce="${nonce}">
+(function() {
+    var agents = {
+        orchestrator:  { emoji: '🎯', label: 'Orchestrator' },
+        architecture:  { emoji: '🏗️', label: 'Architecture' },
+        security:      { emoji: '🛡️', label: 'Security' },
+        dependencies:  { emoji: '📦', label: 'Dependencies' },
+        tdd_coder:     { emoji: '🧪', label: 'TDD Coder' },
+        pm_agent:      { emoji: '📋', label: 'PM Agent' },
+        data_leakage:  { emoji: '🔒', label: 'Data Leakage' },
+        ethics:        { emoji: '⚖️', label: 'Ethics' },
+        review:        { emoji: '✅', label: 'Review' },
+        recovery_agent: { emoji: '🚑', label: 'Recovery Agent' } // 🔥 NEW: Added mapping
     };
-}
 
-function logApiResponse(agent: string, globalIter: number, turnIter: number, response: any, durationMs: number) {
-    logSeparator(`API RESPONSE  [agent=${agent}] [globalIter=${globalIter}] [turnIter=${turnIter}]`);
-    log('DEBUG', `Duration: ${durationMs}ms`);
-    log('DEBUG', 'Response type:', response?.type ?? 'unknown');
-    const rawSummary = summariseRawAssistantMessage(response);
-    log('DEBUG', 'Raw response summary:', rawSummary);
-    if (response?.type === 'function_calls') {
-        log('DEBUG', `Function calls (${response.calls?.length ?? 0}):`,
-            (response.calls ?? []).map((c: any) => `${c.name}(${JSON.stringify(c.args)})`));
-        if (response.text) {
-            log('DEBUG', 'Accompanying text:', response.text);
-        }
-    } else if (response?.type === 'text') {
-        log('DEBUG', 'Text response:', response.text);
-        if (agent === 'orchestrator' && !response?.text?.trim()) {
-            log('WARN', 'Orchestrator returned empty text response. See raw response summary above for part-level diagnostics.');
-        }
-    } else {
-        log('WARN', 'Unexpected response shape:', response);
+    var toolCounts = {};
+    var agentsRunSet = {};
+    var totalTools = 0;
+    var startTime = null;
+    var timerInterval = null;
+
+    /* ── Helpers ──────────────────────────────────────────────────────── */
+    function ts() {
+        var d = new Date();
+        return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
     }
-}
+    function getLabel(agent) { return agents[agent] ? agents[agent].label : agent; }
+    function getEmoji(agent) { return agents[agent] ? agents[agent].emoji : '🤖'; }
 
-function logAgentRouting(from: string | null, to: string | null, reason: string) {
-    log('INFO', `ROUTING  ${from ?? 'START'} → ${to ?? 'DONE'}  (${reason})`);
-    // 🔥 Dashboard Hook: Routing event
-    ForgeDashboard.sendEvent({ type: 'routing', data: { from: from, to: to } });
-}
+    /* ── Timer ────────────────────────────────────────────────────────── */
+    function startTimer() {
+        if (timerInterval) return;
+        startTime = Date.now();
+        timerInterval = setInterval(function() {
+            var s = Math.floor((Date.now() - startTime) / 1000);
+            var m = Math.floor(s / 60);
+            s = s % 60;
+            document.getElementById('timer').textContent = ('0'+m).slice(-2) + ':' + ('0'+s).slice(-2);
+        }, 500);
+    }
+    function stopTimer() { if (timerInterval) { clearInterval(timerInterval); timerInterval = null; } }
 
-function logChatHistory(agent: string, history: any[]) {
-    log('DEBUG', `[${agent}] Chat history (${history.length} messages):`);
-    history.forEach((msg, i) => {
-        const parts = (msg.parts ?? []).map((p: any) => {
-            if (p.text !== undefined) return `text:"${p.text.slice(0, 120)}${p.text.length > 120 ? '…' : ''}"`;
-            if (p.functionCall) return `functionCall:${p.functionCall.name}`;
-            if (p.functionResponse) return `functionResponse:${p.functionResponse.name}`;
-            return JSON.stringify(p);
-        });
-        log('DEBUG', `  [${i}] role=${msg.role}  parts=[${parts.join(', ')}]`);
+    /* ── Status ───────────────────────────────────────────────────────── */
+    function setStatus(state, text) {
+        var el = document.getElementById('status');
+        el.className = 'status ' + state;
+        document.getElementById('status-text').textContent = text;
+    }
+
+    /* ── Phase ────────────────────────────────────────────────────────── */
+    function setPhase(phase) {
+        var phases = document.querySelectorAll('.phase');
+        var connectors = document.querySelectorAll('.phase-connector');
+        for (var i = 0; i < phases.length; i++) {
+            var p = parseInt(phases[i].getAttribute('data-phase'));
+            phases[i].className = 'phase' + (p < phase ? ' done' : (p === phase ? ' active' : ''));
+        }
+        for (var j = 0; j < connectors.length; j++) {
+            connectors[j].className = 'phase-connector' + (j < phase - 1 ? ' lit' : '');
+        }
+        document.getElementById('stat-phase').textContent = phase;
+    }
+
+    /* ── Agent State ──────────────────────────────────────────────────── */
+    function setAgentState(agent, state) {
+        var card = document.getElementById('card-' + agent);
+        if (!card) return;
+        card.className = card.className.replace(/ (active|done|error)/g, '');
+        if (state) card.className += ' ' + state;
+
+        var statusEl = document.getElementById('status-' + agent);
+        if (statusEl) {
+            var labels = { active: 'Running\u2026', done: 'Complete', error: 'Error', idle: 'Idle' };
+            statusEl.textContent = labels[state] || 'Idle';
+        }
+
+        if (state === 'active') {
+            agentsRunSet[agent] = true;
+            document.getElementById('stat-agents').textContent = Object.keys(agentsRunSet).length;
+            var conn = document.getElementById('connector');
+            if (conn) conn.className = 'connector lit';
+        }
+    }
+
+    function resetAllAgents() {
+        var keys = Object.keys(agents);
+        for (var k = 0; k < keys.length; k++) {
+            setAgentState(keys[k], '');
+            toolCounts[keys[k]] = 0;
+            var badge = document.getElementById('tools-' + keys[k]);
+            if (badge) badge.textContent = '';
+        }
+        agentsRunSet = {};
+        totalTools = 0;
+        document.getElementById('stat-agents').textContent = '0';
+        document.getElementById('stat-tools').textContent = '0';
+        document.getElementById('stat-phase').textContent = '—';
+    }
+
+    /* ── Tool Count Badge ─────────────────────────────────────────────── */
+    function addToolCall(agent) {
+        if (!toolCounts[agent]) toolCounts[agent] = 0;
+        toolCounts[agent]++;
+        totalTools++;
+        var badge = document.getElementById('tools-' + agent);
+        if (badge) badge.textContent = toolCounts[agent] + ' tool' + (toolCounts[agent] > 1 ? 's' : '');
+        document.getElementById('stat-tools').textContent = totalTools;
+    }
+
+    /* ── Event Log ────────────────────────────────────────────────────── */
+    function addLog(type, message) {
+        var container = document.getElementById('log-entries');
+        var entry = document.createElement('div');
+        entry.className = 'log-entry ' + type;
+        entry.innerHTML = '<span class="log-ts">' + ts() + '</span>' + escapeHtml(message);
+        container.appendChild(entry);
+        container.scrollTop = container.scrollHeight;
+        while (container.children.length > 200) container.removeChild(container.firstChild);
+    }
+    function escapeHtml(s) {
+        var d = document.createElement('span');
+        d.textContent = s;
+        return d.innerHTML;
+    }
+
+    document.getElementById('clear-log').addEventListener('click', function() {
+        document.getElementById('log-entries').innerHTML = '';
     });
-}
 
-// ---------------------------------------------------------------------------
-// Workspace Tools
-// ---------------------------------------------------------------------------
-class WorkspaceTools {
-    static getWorkspaceRoot(): string {
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            throw new Error("No active workspace folder");
+    /* ── Message Handler ──────────────────────────────────────────────── */
+    window.addEventListener('message', function(event) {
+        var m = event.data;
+        if (!m || !m.type) return;
+
+        switch (m.type) {
+            case 'pipeline_start':
+                resetAllAgents();
+                startTimer();
+                setStatus('running', 'Running');
+                addLog('system', '🚀 Pipeline started — "' + (m.data && m.data.prompt ? m.data.prompt.slice(0,60) : '') + '"');
+                break;
+            case 'agent_start':
+                setAgentState(m.agent, 'active');
+                addLog('info', getEmoji(m.agent) + ' ' + getLabel(m.agent) + ' started');
+                break;
+            case 'agent_done':
+                setAgentState(m.agent, 'done');
+                addLog('success', '✓ ' + getLabel(m.agent) + ' completed');
+                break;
+            case 'tool_call':
+                addToolCall(m.agent);
+                addLog('tool', '⚙ ' + getLabel(m.agent) + ' → ' + (m.data ? m.data.name : '?') + '()');
+                break;
+            case 'tool_result':
+                addLog('tool', '  ← ' + (m.data ? m.data.name : '?') + ' responded');
+                break;
+            case 'routing':
+                if (m.data && m.data.from) setAgentState(m.data.from, 'done');
+                if (m.data && m.data.to) setAgentState(m.data.to, 'active');
+                addLog('routing', '→ ' + (m.data ? m.data.from || 'start' : '?') + ' → ' + (m.data ? m.data.to || 'done' : '?'));
+                break;
+            case 'phase_update':
+                setPhase(m.data ? m.data.phase : 0);
+                addLog('system', '📍 Phase ' + (m.data ? m.data.phase : '?') + ': ' + (m.data ? m.data.name || '' : ''));
+                break;
+            case 'pipeline_complete':
+                stopTimer();
+                setStatus('complete', 'Complete');
+                addLog('system', '🎉 Pipeline complete');
+                break;
+            case 'error':
+                setStatus('error', 'Error');
+                if (m.agent) setAgentState(m.agent, 'error');
+                addLog('error', '✗ ' + (m.data ? m.data.message || 'Unknown error' : 'Unknown error'));
+                break;
         }
-        return folders[0].uri.fsPath;
-    }
-
-    static async readFile(filepath: string): Promise<string> {
-        try {
-            const fullPath = path.resolve(this.getWorkspaceRoot(), filepath);
-            const content = await fs.promises.readFile(fullPath, 'utf8');
-            return content;
-        } catch (error: any) {
-            return `Error reading file: ${error.message}`;
-        }
-    }
-
-    static async createArtifact(filepath: string, content: string): Promise<string> {
-        try {
-            const fullPath = path.resolve(this.getWorkspaceRoot(), filepath);
-            await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-            await fs.promises.writeFile(fullPath, content, 'utf8');
-            return `Successfully created artifact at ${filepath}`;
-        } catch (error: any) {
-            return `Error creating artifact: ${error.message}`;
-        }
-    }
-
-    static async writeCode(filepath: string, content: string): Promise<string> {
-        try {
-            const fullPath = path.resolve(this.getWorkspaceRoot(), filepath);
-            await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-            await fs.promises.writeFile(fullPath, content, 'utf8');
-            return `Successfully wrote code to ${filepath}`;
-        } catch (error: any) {
-            return `Error writing code: ${error.message}`;
-        }
-    }
-
-    static async executeCommand(command: string): Promise<string> {
-        return new Promise((resolve) => {
-            exec(command, { cwd: this.getWorkspaceRoot() }, (error, stdout, stderr) => {
-                let result = "";
-                if (stdout) result += `STDOUT:\n${stdout}\n`;
-                if (stderr) result += `STDERR:\n${stderr}\n`;
-                if (error) result += `ERROR:\n${error.message}\n`;
-                resolve(result || "Command executed with no output.");
-            });
-        });
-    }
-
-    static async updateTaskStatus(filepath: string, taskString: string, newStatus: string): Promise<string> {
-        try {
-            const fullPath = path.resolve(this.getWorkspaceRoot(), filepath);
-            let content = await fs.promises.readFile(fullPath, 'utf8');
-            if (content.includes(taskString)) {
-                content = content.replace(`- [ ] ${taskString}`, `- [${newStatus}] ${taskString}`);
-                content = content.replace(`- [x] ${taskString}`, `- [${newStatus}] ${taskString}`);
-                content = content.replace(`- [/] ${taskString}`, `- [${newStatus}] ${taskString}`);
-                await fs.promises.writeFile(fullPath, content, 'utf8');
-                return `Successfully updated task status.`;
-            } else {
-                return `Task string not found in file.`;
-            }
-        } catch (error: any) {
-            return `Error updating task status: ${error.message}`;
-        }
-    }
-
-    static async listDirectory(dirPath: string): Promise<string> {
-        try {
-            const fullPath = path.resolve(this.getWorkspaceRoot(), dirPath);
-            const items = await fs.promises.readdir(fullPath, { withFileTypes: true });
-            const result = items.map(i => `${i.isDirectory() ? '[DIR]' : '[FILE]'} ${i.name}`).join('\n');
-            return result === "" ? "Directory is empty." : result;
-        } catch (error: any) {
-            return `Error listing directory: ${error.message}`;
-        }
-    }
-
-    static async searchCode(query: string, searchPath: string): Promise<string> {
-        try {
-            const targetPath = path.resolve(this.getWorkspaceRoot(), searchPath);
-            const results: string[] = [];
-
-            async function walk(dir: string) {
-                const files = await fs.promises.readdir(dir, { withFileTypes: true });
-                for (const file of files) {
-                    const res = path.resolve(dir, file.name);
-                    if (file.isDirectory() && !res.includes('node_modules') && !res.includes('.git') && !res.includes('.venv')) {
-                        await walk(res);
-                    } else if (file.isFile()) {
-                        const ext = path.extname(res);
-                        if (['.ts', '.js', '.py', '.md', '.json', '.yaml', '.yml', '.txt', '.html', '.css'].includes(ext)) {
-                            const content = await fs.promises.readFile(res, 'utf-8');
-                            const lines = content.split('\n');
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].includes(query)) {
-                                    results.push(`${res.replace(targetPath, '')}:${i + 1}: ${lines[i].trim()}`);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            await walk(targetPath);
-            return results.length > 0 ? results.slice(0, 100).join('\n') : "No matches found.";
-        } catch (error: any) {
-            return `Error searching code: ${error.message}`;
-        }
-    }
-
-    // 🔥 NEW: Context Bus Handlers
-    static async readContext(): Promise<string> {
-        try {
-            const contextPath = path.resolve(this.getWorkspaceRoot(), '.forge', 'context_bus.json');
-            if (!fs.existsSync(contextPath)) {
-                return "{}";
-            }
-            const content = await fs.promises.readFile(contextPath, 'utf8');
-            return content;
-        } catch (error: any) {
-            return `Error reading context: ${error.message}`;
-        }
-    }
-
-    static async updateContext(updates: any): Promise<string> {
-        try {
-            const forgeDir = path.resolve(this.getWorkspaceRoot(), '.forge');
-            const contextPath = path.resolve(forgeDir, 'context_bus.json');
-
-            await fs.promises.mkdir(forgeDir, { recursive: true });
-
-            let currentContext = {};
-            if (fs.existsSync(contextPath)) {
-                const content = await fs.promises.readFile(contextPath, 'utf8');
-                try {
-                    currentContext = JSON.parse(content);
-                } catch (e) {
-                    log('WARN', 'Could not parse existing context_bus.json, starting fresh.');
-                }
-            }
-
-            const updatesObj = typeof updates === 'string' ? JSON.parse(updates) : updates;
-            const newContext = { ...currentContext, ...updatesObj };
-
-            await fs.promises.writeFile(contextPath, JSON.stringify(newContext, null, 2), 'utf8');
-            return `Successfully updated context bus.`;
-        } catch (error: any) {
-            return `Error updating context: ${error.message}`;
-        }
-    }
-
-    // 🔥 NEW: Execution Trace Logger
-    static async appendToTrace(text: string): Promise<void> {
-        try {
-            const tracePath = path.resolve(this.getWorkspaceRoot(), '.forge', 'execution_trace.log');
-            await fs.promises.mkdir(path.dirname(tracePath), { recursive: true });
-            await fs.promises.appendFile(tracePath, text + '\n', 'utf8');
-        } catch (e) {
-            // Silently fail if we can't write to the trace log
-        }
+    });
+})();
+</script>
+</body>
+</html>`;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Extension entry point
-// ---------------------------------------------------------------------------
-const agentMeta: Record<string, { emoji: string; label: string }> = {
-    workspace_analyzer: { emoji: '👁️', label: 'Workspace Analyzer' },
-    orchestrator: { emoji: '🎯', label: 'Orchestrator' },
-    architecture: { emoji: '🏗️', label: 'Architecture Agent' },
-    security: { emoji: '🛡️', label: 'Security Agent' },
-    dependencies: { emoji: '📦', label: 'Dependency Agent' },
-    tdd_coder: { emoji: '🧪', label: 'TDD Coder' },
-    pm_agent: { emoji: '📋', label: 'PM Agent' },
-    data_leakage: { emoji: '🔒', label: 'Data Leakage Agent' },
-    ethics: { emoji: '⚖️', label: 'Ethics Agent' },
-    review: { emoji: '✅', label: 'Review Agent' },
-    recovery_agent: { emoji: '🚑', label: 'Recovery Agent' }
-};
-
-function getAgentDisplay(agent: string): { emoji: string; label: string } {
-    return agentMeta[agent] ?? { emoji: '🤖', label: agent };
-}
-
-export function activate(context: vscode.ExtensionContext) {
-    getLogger().show(true);
-    log('INFO', 'Forge extension activated. Output channel: "Forge Debug"');
-
-    const handler: vscode.ChatRequestHandler = async (
-        request: vscode.ChatRequest,
-        chatContext: vscode.ChatContext,
-        stream: vscode.ChatResponseStream,
-        token: vscode.CancellationToken
-    ) => {
-        const userPrompt = request.prompt;
-        const editor = vscode.window.activeTextEditor;
-        const selectedText = editor ? editor.document.getText(editor.selection) : "";
-
-        // 🔥 Dashboard Hook: Open the dashboard and start the session
-        ForgeDashboard.createOrShow();
-        ForgeDashboard.sendEvent({ type: 'pipeline_start', data: { prompt: userPrompt } });
-
-        logSeparator(`NEW REQUEST  "${userPrompt.slice(0, 80)}"`);
-
-        try {
-            const forgeConfig = vscode.workspace.getConfiguration('forge');
-            const credentialsFile = forgeConfig.get<string>('credentialsFile')?.trim();
-            const quotaProject = forgeConfig.get<string>('quotaProject')?.trim();
-            const location = forgeConfig.get<string>('location', 'us-central1')?.trim() || 'us-central1';
-            const endpointId = forgeConfig.get<string>('endpointId', 'projects/718442730167/locations/us-central1/reasoningEngines/3996292658896044032')?.trim()
-                || 'projects/718442730167/locations/us-central1/reasoningEngines/3996292658896044032';
-            const fastModeEnabled = forgeConfig.get<boolean>('fastMode', true);
-            const maxOrchestratorRetries = Math.max(1, forgeConfig.get<number>('maxOrchestratorRetries', 2));
-            const mvpDemoMode = forgeConfig.get<boolean>('mvpDemoMode', false);
-            const mvpMaxTurnsPerAgent = Math.max(1, forgeConfig.get<number>('mvpMaxTurnsPerAgent', 4));
-
-            const authOptions: any = { scopes: 'https://www.googleapis.com/auth/cloud-platform' };
-            if (credentialsFile) authOptions.keyFilename = credentialsFile;
-            if (quotaProject) authOptions.quotaProjectId = quotaProject;
-
-            const auth = new GoogleAuth(authOptions);
-            const client = await auth.getClient();
-            const url = `https://${location}-aiplatform.googleapis.com/v1beta1/${endpointId}:query`;
-
-            let currentAgent: string | null = "workspace_analyzer";
-            let currentPrompt: string | null = `Please analyze the current directory and Task_list.md and provide a state summary for the Orchestrator regarding this new user request: "${userPrompt}"`;
-
-            // 🔥 NEW: Context Recovery Intercept
-            const normalizedPrompt = userPrompt.toLowerCase().trim();
-            if (normalizedPrompt === "continue" || normalizedPrompt.includes("resume")) {
-                currentAgent = "recovery_agent";
-                currentPrompt = `The system experienced an interruption. Read the execution trace log and the current workspace state to determine exactly where we left off. Provide a Warm Start Directive for the Orchestrator.`;
-                await WorkspaceTools.appendToTrace(`\n--- SYSTEM RECOVERY INITIATED ---`);
-            }
-
-            let dagState: any = {};
-            const globalExecutionLog: string[] = [];
-            let orchestratorJsonParseFailures = 0;
-            let missingTaskListDetected = false;
-            let orchestratorEmptyTextStreak = 0;
-            let taskListAvailable = false;
-            let bootstrapFallbackUsed = false;
-            let taskListAutoCreated = false;
-            let pmAgentRunCount = 0;
-            let forceTddMode = false;
-            let orchestratorFailureCount = 0;
-            const usedAgents = new Set<string>();
-            const touchedFiles = new Set<string>();
-
-            let globalMaxIter = 50;
-
-            while (currentAgent && globalMaxIter > 0) {
-                if (token.isCancellationRequested) break;
-                globalMaxIter--;
-
-                // 🔥 Dashboard Hook: Mark agent as running
-                ForgeDashboard.sendEvent({ type: 'agent_start', agent: currentAgent });
-
-                if (currentAgent) usedAgents.add(currentAgent);
-
-                const requestData: any = {
-                    agent_name: currentAgent,
-                    prompt: currentPrompt,
-                    context: selectedText
-                };
-
-                const agentDisplay = getAgentDisplay(currentAgent);
-                stream.progress(`${agentDisplay.emoji} [${agentDisplay.label}] Initializing...`);
-
-                const t0 = Date.now();
-                let turnResponse = await client.request({
-                    url: url,
-                    method: 'POST',
-                    data: { input: requestData },
-                    timeout: 120000
-                });
-
-                let currentResponse = (turnResponse.data as any).output;
-                logApiResponse(currentAgent, (50 - globalMaxIter), 0, currentResponse, Date.now() - t0);
-
-                const chatHistory: any[] = [];
-                let isFinished = false;
-                let turnIter = 15;
-
-                while (!isFinished && turnIter > 0) {
-                    if (token.isCancellationRequested) break;
-                    turnIter--;
-
-                    chatHistory.push(currentResponse.raw_assistant_message);
-                    let nextMessageContent: any;
-
-                    if (currentResponse.type === "function_calls") {
-                        const functionResponses: any[] = [];
-                        const text = currentResponse.text || "";
-                        const ad = getAgentDisplay(currentAgent!);
-
-                        if (text) {
-                            stream.markdown(`\n> ${ad.emoji} **${ad.label}** thought:\n> ${text.replace(/\n/g, '\n> ')}\n\n`);
-                        }
-
-                        stream.markdown(`\n> ⚙️ **${ad.label}** is executing tools:\n`);
-
-                        for (const call of currentResponse.calls) {
-                            const name = call.name;
-                            const args = call.args;
-                            let apiResponse = "";
-
-                            // 🔥 Dashboard Hook: Tool Execution Started
-                            ForgeDashboard.sendEvent({ type: 'tool_call', agent: currentAgent, data: { name: name } });
-
-                            globalExecutionLog.push(`[${currentAgent}] Tool Call: ${name}`);
-                            await WorkspaceTools.appendToTrace(`[${currentAgent}] Tool Call: ${name}(${JSON.stringify(args)})`);
-                            stream.markdown(`> - \`${name}\`\n`);
-
-                            try {
-                                if (name === "read_file") {
-                                    apiResponse = await WorkspaceTools.readFile(args.filepath);
-                                    if (currentAgent === "orchestrator" && args.filepath === ".forge/Task_list.md") {
-                                        taskListAvailable = !apiResponse.includes("ENOENT");
-                                    }
-                                } else if (name === "create_artifact") {
-                                    apiResponse = await WorkspaceTools.createArtifact(args.filepath, args.content);
-                                } else if (name === "write_code") {
-                                    apiResponse = await WorkspaceTools.writeCode(args.filepath, args.content);
-                                } else if (name === "execute_command") {
-                                    apiResponse = await WorkspaceTools.executeCommand(args.command);
-                                } else if (name === "update_task_status") {
-                                    apiResponse = await WorkspaceTools.updateTaskStatus(args.filepath, args.task_string, args.new_status);
-                                } else if (name === "list_directory") {
-                                    apiResponse = await WorkspaceTools.listDirectory(args.path);
-                                } else if (name === "search_code") {
-                                    apiResponse = await WorkspaceTools.searchCode(args.query, args.directory);
-                                } else if (name === "read_context") {
-                                    apiResponse = await WorkspaceTools.readContext();
-                                } else if (name === "update_context") {
-                                    apiResponse = await WorkspaceTools.updateContext(args.updates);
-                                } else {
-                                    apiResponse = `Tool ${name} not implemented locally.`;
-                                }
-                            } catch (e: any) {
-                                apiResponse = `Tool execution failed: ${e.message}`;
-                            }
-
-                            // 🔥 Dashboard Hook: Tool Execution Completed
-                            ForgeDashboard.sendEvent({ type: 'tool_result', agent: currentAgent, data: { name: name } });
-
-                            functionResponses.push({
-                                functionResponse: { name: name, response: { content: apiResponse } }
-                            });
-                        }
-
-                        stream.markdown(`\n`);
-                        nextMessageContent = JSON.stringify(functionResponses);
-
-                    } else {
-                        // Text response block
-                        const text = currentResponse.text || "";
-                        globalExecutionLog.push(`[${currentAgent}] Agent Output: ${text}`);
-                        await WorkspaceTools.appendToTrace(`[${currentAgent}] Agent Output: ${text}`);
-
-                        // 🔥 Dashboard Hook: Mark agent as successfully done
-                        ForgeDashboard.sendEvent({ type: 'agent_done', agent: currentAgent });
-
-                        if (currentAgent === "workspace_analyzer" || currentAgent === "recovery_agent") {
-                            logAgentRouting(currentAgent, "orchestrator", "analyzer/recovery finished");
-                            currentAgent = "orchestrator";
-                            currentPrompt = `Workspace State Report:\n${text}\n\nProvide the STRICT JSON routing response.`;
-                            isFinished = true;
-                            continue;
-                        }
-                        else if (currentAgent === "orchestrator") {
-                            try {
-                                const startIndex = text.indexOf('{');
-                                const endIndex = text.lastIndexOf('}');
-                                if (startIndex === -1 || endIndex === -1) throw new Error("No JSON found");
-
-                                const jsonString = text.substring(startIndex, endIndex + 1);
-                                dagState = JSON.parse(jsonString);
-
-                                // 🔥 Dashboard Hook: Phase Update Detection
-                                if (dagState.phase !== undefined) {
-                                    ForgeDashboard.sendEvent({
-                                        type: 'phase_update',
-                                        data: { phase: dagState.phase, name: dagState.phase_name || "Executing" }
-                                    });
-                                }
-
-                                if (dagState.message_to_user) {
-                                    stream.markdown(`**Orchestrator:** ${dagState.message_to_user}\n\n`);
-                                }
-
-                                const nextRoute = dagState.next_agent_routing;
-                                if (nextRoute && nextRoute !== "none" && nextRoute !== "null") {
-                                    logAgentRouting(currentAgent, nextRoute, `DAG routing`);
-                                    currentAgent = nextRoute;
-                                    currentPrompt = `Original User Request: ${userPrompt}\n\nDAG State:\n${JSON.stringify(dagState, null, 2)}\n\nBegin execution.`;
-                                } else {
-                                    logAgentRouting(currentAgent, null, `Done`);
-                                    currentAgent = null;
-                                }
-                                isFinished = true;
-                                continue;
-                            } catch (e: any) {
-                                nextMessageContent = "Your output failed to parse. You MUST output valid JSON.";
-                            }
-                        }
-                        else {
-                            stream.markdown(`${text}\n\n`);
-                            logAgentRouting(currentAgent, "workspace_analyzer", "worker finished");
-                            currentAgent = "workspace_analyzer";
-                            currentPrompt = `The agent just finished its work and returned: "${text}".\n\nPlease analyze the current directory and Task_list.md and provide a state summary.`;
-                            isFinished = true;
-                            continue;
-                        }
-                    }
-
-                    if (isFinished) break;
-
-                    if (nextMessageContent) {
-                        chatHistory.push({ role: "user", parts: [{ text: nextMessageContent }] });
-                        const nextRequestData = { agent_name: currentAgent, message: nextMessageContent, chat_history: chatHistory };
-                        turnResponse = await client.request({ url: url, method: 'POST', data: { input: nextRequestData }, timeout: 120000 });
-                        currentResponse = (turnResponse.data as any).output;
-                    }
-                }
-            }
-
-            // 🔥 Dashboard Hook: Pipeline finished successfully
-            ForgeDashboard.sendEvent({ type: 'pipeline_complete' });
-            stream.markdown(`\n\n--- \n*DAG Execution Complete.*`);
-
-        } catch (error: any) {
-            // 🔥 Dashboard Hook: Error encountered
-            ForgeDashboard.sendEvent({ type: 'error', data: { message: error?.message || 'Unknown error' } });
-            stream.markdown(`\n\n**Forge Error:** ${error}`);
-        }
-
-        return { metadata: { command: '' } };
-    };
-
-    try {
-        const chatApi = (vscode as any).chat;
-        if (chatApi?.createChatParticipant) {
-            const forgeChat = chatApi.createChatParticipant("forge.chat", handler);
-            context.subscriptions.push(forgeChat);
-        }
-    } catch (error: any) {
-        vscode.window.showErrorMessage(`Forge activation error: ${error?.message}`);
+function getNonce() {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
     }
+    return text;
 }
