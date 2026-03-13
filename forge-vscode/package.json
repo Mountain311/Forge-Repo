@@ -17,7 +17,52 @@
         "name": "forge",
         "description": "Forge AI Assistant"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Forge",
+      "properties": {
+        "forge.fastMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Fast Mode. When enabled, the Orchestrator will be bypassed to keep looping the TDD Coder until all unchecked tasks are completed."
+        },
+        "forge.mvpDemoMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable MVP Demo Mode. Runs a deterministic, lightweight multi-agent walkthrough using local fallback stubs."
+        },
+        "forge.credentialsFile": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to a custom Google Cloud service account JSON credentials file."
+        },
+        "forge.quotaProject": {
+          "type": "string",
+          "default": "",
+          "description": "Custom Google Cloud project ID to use for quota and billing."
+        },
+        "forge.location": {
+          "type": "string",
+          "default": "us-central1",
+          "description": "Google Cloud location for the Vertex AI Reasoning Engine endpoint."
+        },
+        "forge.endpointId": {
+          "type": "string",
+          "default": "projects/718442730167/locations/us-central1/reasoningEngines/1613747718528696320",
+          "description": "The full Resource Name ID of your deployed Vertex AI Reasoning Engine."
+        },
+        "forge.maxOrchestratorRetries": {
+          "type": "number",
+          "default": 2,
+          "description": "Maximum number of times the Orchestrator is allowed to fail (e.g., returning invalid JSON) before triggering fallback routing."
+        },
+        "forge.mvpMaxTurnsPerAgent": {
+          "type": "number",
+          "default": 4,
+          "description": "Maximum number of tool-execution turns allowed per agent when running in MVP Demo Mode."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

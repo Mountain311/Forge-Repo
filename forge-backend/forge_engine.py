@@ -174,6 +174,30 @@ search_code_func = FunctionDeclaration(
     }
 )
 
+read_context_func = FunctionDeclaration(
+    name="read_context",
+    description="Reads the global context bus state from .forge/context_bus.json. Contains phase, scores, flags, and global variables.",
+    parameters={
+        "type": "object",
+        "properties": {}
+    }
+)
+
+update_context_func = FunctionDeclaration(
+    name="update_context",
+    description="Updates the global context bus. Provide only the keys and new values that need to change.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "updates": {
+                "type": "object",
+                "description": "A JSON object containing the keys and new values to merge into the existing context bus."
+            }
+        },
+        "required": ["updates"]
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Dynamic Tool Loading
 # ---------------------------------------------------------------------------
@@ -186,6 +210,8 @@ FUNCTION_MAP = {
     "update_task_status": update_task_status_func,
     "list_directory": list_directory_func,
     "search_code": search_code_func,
+    "read_context": read_context_func,       # <-- ADDED THIS
+    "update_context": update_context_func,   # <-- ADDED THIS
 }
 
 def _get_tools_for_agent(agent_config: dict) -> list:
