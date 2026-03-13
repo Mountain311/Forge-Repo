@@ -235,7 +235,7 @@ export function activate(context: vscode.ExtensionContext) {
             const client = await auth.getClient();
 
             const location = "us-central1";
-            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/1613747718528696320";
+            const endpointId = "projects/718442730167/locations/us-central1/reasoningEngines/6195034439471333376";
             const url = `https://${location}-aiplatform.googleapis.com/v1beta1/${endpointId}:query`;
 
             let currentAgent: string | null = "orchestrator";
@@ -403,10 +403,23 @@ export function activate(context: vscode.ExtensionContext) {
                     if (isFinished) break;
 
                     if (nextMessageContent) {
-                        chatHistory.push({
-                            role: "user",
-                            parts: [{ text: nextMessageContent }]
-                        });
+                        // If nextMessageContent is JSON function responses, store them
+                        // as proper functionResponse parts in history (not as a text part).
+                        // This is critical — the model needs to see the correct conversation
+                        // structure or it will return empty responses.
+                        try {
+                            const parsed = JSON.parse(nextMessageContent);
+                            if (Array.isArray(parsed) && parsed[0]?.functionResponse) {
+                                chatHistory.push({
+                                    role: "user",
+                                    parts: parsed.map((p: any) => ({ functionResponse: p.functionResponse }))
+                                });
+                            } else {
+                                chatHistory.push({ role: "user", parts: [{ text: nextMessageContent }] });
+                            }
+                        } catch {
+                            chatHistory.push({ role: "user", parts: [{ text: nextMessageContent }] });
+                        }
 
                         const nextRequestData = {
                             agent_name: currentAgent,

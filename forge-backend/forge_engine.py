@@ -1,15 +1,26 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import yaml
 import json
 import os
 import logging
 import time
 from pathlib import Path
+
+# python-dotenv is optional — not available in the Reasoning Engine container
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import vertexai
 from vertexai.generative_models import GenerativeModel, Tool, Part, FunctionDeclaration
-from tools import tool_map
+
+# tools.py is an extra_package — import lazily inside methods to avoid
+# ImportError at container startup before packages are fully extracted
+try:
+    from tools import tool_map
+except ImportError:
+    tool_map = {}
 
 # ---------------------------------------------------------------------------
 # Logging Setup — writes structured JSON directly to Google Cloud Logging
@@ -206,6 +217,8 @@ class ForgeEngine:
         vertexai.init(project=project, location=location)
 
         config_dir = Path(__file__).parent / "agent_configs"
+        if not config_dir.exists():
+            config_dir = Path("agent_configs")
         logger.info(f"Loading agent configs from: {config_dir}")
         for config_file in config_dir.glob("*.yaml"):
             with open(config_file, "r") as f:
@@ -238,18 +251,20 @@ class ForgeEngine:
 
         self._ensure_initialized()
 
-        if message is not None:
-            return self._send_message_to_agent(agent_name, message, chat_history)
-
-        if agent_name == "orchestrator":
+        # Orchestrator always runs fully server-side to avoid Gemini blocking
+        # text output when tools are active
+        if agent_name == "orchestrator" and message is None:
             initial_prompt = (
                 f"User Request: {prompt}\n"
                 f"Code Context:\n{context}\n\n"
-                f"Please determine the next routing step. Use tools to read files if necessary."
+                f"Please determine the next routing step."
             )
-        else:
-            initial_prompt = prompt
+            return self._run_orchestrator(initial_prompt)
 
+        if message is not None:
+            return self._send_message_to_agent(agent_name, message, chat_history)
+
+        initial_prompt = prompt
         logger.info(f"Fresh start for agent '{agent_name}'")
         return self._send_message_to_agent(agent_name, initial_prompt, [])
 
@@ -280,6 +295,103 @@ class ForgeEngine:
         except IndexError as e:
             logger.warning(f"_extract_text: {e}")
         return text.strip()
+
+    # ------------------------------------------------------------------
+    def _run_orchestrator(self, prompt: str) -> dict:
+        """
+        Runs the orchestrator entirely server-side.
+        Tool calls (list_directory, read_file) are executed here using tools.py,
+        then the model is called a final time with tool_config=NONE to force
+        plain JSON output — avoiding the Gemini issue where tools=active blocks
+        text responses.
+        """
+        from vertexai.generative_models import ToolConfig
+        import vertexai.generative_models as gm
+
+        self._ensure_initialized()
+        config = self.configs["orchestrator"]
+        model_name = config["model"]
+
+        model = GenerativeModel(
+            model_name,
+            system_instruction=config["instructions"],
+            tools=[forge_tools]
+        )
+
+        contents = [gm.Content(role="user", parts=[Part.from_text(prompt)])]
+        MAX_TOOL_ROUNDS = 5
+
+        for round_num in range(MAX_TOOL_ROUNDS):
+            clog("ORCHESTRATOR_TOOL_ROUND", severity="INFO",
+                 round=round_num, num_turns=len(contents))
+
+            response = model.generate_content(
+                contents,
+                generation_config={"temperature": 0},
+            )
+            fn_calls = self._extract_function_calls(response)
+
+            if not fn_calls:
+                # Model returned text — shouldn't happen mid-loop but handle it
+                break
+
+            # Append model turn
+            model_parts = []
+            text = self._extract_text(response)
+            if text:
+                model_parts.append(Part.from_text(text))
+            for c in fn_calls:
+                model_parts.append(Part.from_dict({"function_call": {
+                    "name": c.name,
+                    "args": {k: v for k, v in c.args.items()}
+                }}))
+            contents.append(gm.Content(role="model", parts=model_parts))
+
+            # Execute tools server-side
+            from tools import tool_map
+            response_parts = []
+            for c in fn_calls:
+                tool_fn = tool_map.get(c.name)
+                if tool_fn:
+                    try:
+                        result = tool_fn(**{k: v for k, v in c.args.items()})
+                    except Exception as e:
+                        result = f"Tool error: {e}"
+                else:
+                    result = f"Unknown tool: {c.name}"
+                clog("ORCHESTRATOR_TOOL_RESULT", severity="DEBUG",
+                     tool=c.name, result=str(result)[:300])
+                response_parts.append(Part.from_function_response(
+                    name=c.name, response={"content": result}
+                ))
+            contents.append(gm.Content(role="user", parts=response_parts))
+
+        # Final call with tool_config=NONE to force plain JSON text output
+        clog("ORCHESTRATOR_FINAL_CALL", severity="INFO",
+             num_turns=len(contents))
+
+        final_model = GenerativeModel(
+            model_name,
+            system_instruction=config["instructions"],
+            tools=[forge_tools],
+            tool_config=ToolConfig(
+                function_calling_config=ToolConfig.FunctionCallingConfig(
+                    mode=ToolConfig.FunctionCallingConfig.Mode.NONE
+                )
+            )
+        )
+        final_response = final_model.generate_content(
+            contents,
+            generation_config={"temperature": 0},
+        )
+        text = self._extract_text(final_response)
+        clog("ORCHESTRATOR_FINAL_RESPONSE", severity="INFO", text=text)
+
+        return {
+            "type": "text",
+            "text": text,
+            "raw_assistant_message": {"role": "model", "parts": [{"text": text}]}
+        }
 
     # ------------------------------------------------------------------
     def _send_message_to_agent(
