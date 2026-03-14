@@ -1,11 +1,8 @@
-import yaml
 import json
 import os
 import logging
 import time
-from pathlib import Path
 
-# python-dotenv is optional — not available in the Reasoning Engine container
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -15,16 +12,14 @@ except ImportError:
 import vertexai
 from vertexai.generative_models import GenerativeModel, Tool, Part, FunctionDeclaration
 
-# tools.py is an extra_package — import lazily inside methods to avoid
-# ImportError at container startup before packages are fully extracted
+# 🔥 NEW: Import the baked Python dictionary directly!
 try:
-    from tools import tool_map
+    from agent_registry import AGENT_CONFIGS
 except ImportError:
-    tool_map = {}
+    AGENT_CONFIGS = {}
 
 # ---------------------------------------------------------------------------
-# Logging Setup — writes structured JSON directly to Google Cloud Logging
-# so you can query it in the Cloud Console Logs Explorer.
+# Logging Setup
 # ---------------------------------------------------------------------------
 try:
     import google.cloud.logging as gcloud_logging
@@ -36,411 +31,107 @@ try:
     _use_cloud_logging = True
 except Exception as _e:
     _use_cloud_logging = False
-    print(f"[forge_engine] WARNING: google-cloud-logging unavailable ({_e}), falling back to stderr")
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("forge_engine")
-logger.setLevel(logging.DEBUG)
-
 if _use_cloud_logging:
     logger.addHandler(_cloud_handler)
 
-_gcloud_logger = _gcloud_client.logger("forge_engine") if _use_cloud_logging else None
-
 def clog(event: str, severity: str = "DEBUG", **fields):
-    """Write a structured log entry visible in Cloud Logging Logs Explorer."""
     payload = {"event": event, **fields}
-    if _gcloud_logger:
-        _gcloud_logger.log_struct(payload, severity=severity)
     print(f"[{severity}] {json.dumps(payload, default=str)}", flush=True)
-
-clog("ENGINE_INIT", severity="INFO", message="Forge Engine logging initialised")
-
-def _truncate(value: any, max_chars: int = 400) -> str:
-    """Return a safely truncated string representation of any value."""
-    s = value if isinstance(value, str) else json.dumps(value, default=str)
-    return s[:max_chars] + ("…" if len(s) > max_chars else "")
-
-def _serialise_contents(contents: list) -> list:
-    """Convert Vertex AI Content objects into plain dicts for structured logging."""
-    result = []
-    for c in contents:
-        parts = []
-        for p in c.parts:
-            try:
-                if hasattr(p, 'function_call') and p.function_call.name:
-                    parts.append({
-                        "type": "function_call",
-                        "name": p.function_call.name,
-                        "args": {k: v for k, v in p.function_call.args.items()}
-                    })
-                elif hasattr(p, 'text') and p.text:
-                    parts.append({"type": "text", "text": p.text})
-                else:
-                    parts.append({"type": "unknown"})
-            except Exception:
-                parts.append({"type": "unreadable"})
-        result.append({"role": c.role, "parts": parts})
-    return result
 
 # ---------------------------------------------------------------------------
 # Function Declaration Schemas
 # ---------------------------------------------------------------------------
-
-read_file_func = FunctionDeclaration(
-    name="read_file",
-    description="Reads the content of a file from the sandbox.",
-    parameters={
-        "type": "object",
-        "properties": {"filepath": {"type": "string", "description": "The exact path to the file."}},
-        "required": ["filepath"]
-    }
-)
-
-create_artifact_func = FunctionDeclaration(
-    name="create_artifact",
-    description="Creates or updates a planning artifact (e.g., .md files in the .forge/ directory).",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string", "description": "The exact path to the file."},
-            "content": {"type": "string", "description": "The full markdown content to write."}
-        },
-        "required": ["filepath", "content"]
-    }
-)
-
-write_code_func = FunctionDeclaration(
-    name="write_code",
-    description="Writes application code to a file in the workspace.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string", "description": "The exact path to the source code file."},
-            "content": {"type": "string", "description": "The full code snippet to write."}
-        },
-        "required": ["filepath", "content"]
-    }
-)
-
-execute_command_func = FunctionDeclaration(
-    name="execute_command",
-    description="Executes a bash command and returns the output.",
-    parameters={
-        "type": "object",
-        "properties": {"command": {"type": "string", "description": "The terminal command to run."}},
-        "required": ["command"]
-    }
-)
-
-update_task_status_func = FunctionDeclaration(
-    name="update_task_status",
-    description="Updates the checkbox status of a specific task in a markdown task list.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string"},
-            "task_string": {"type": "string"},
-            "new_status": {"type": "string"}
-        },
-        "required": ["filepath", "task_string", "new_status"]
-    }
-)
-
-list_directory_func = FunctionDeclaration(
-    name="list_directory",
-    description="Returns the contents of a specified directory.",
-    parameters={
-        "type": "object",
-        "properties": {"path": {"type": "string", "description": "The directory path to list."}},
-        "required": ["path"]
-    }
-)
-
-search_code_func = FunctionDeclaration(
-    name="search_code",
-    description="Searches for a string across source files in the workspace.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "directory": {"type": "string"}
-        },
-        "required": ["query", "directory"]
-    }
-)
-
-read_context_func = FunctionDeclaration(
-    name="read_context",
-    description="Reads the global context bus state from .forge/context_bus.json. Contains phase, scores, flags, and global variables.",
-    parameters={
-        "type": "object",
-        "properties": {}
-    }
-)
-
-update_context_func = FunctionDeclaration(
-    name="update_context",
-    description="Updates the global context bus. Provide only the keys and new values that need to change.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "updates": {
-                "type": "object",
-                "description": "A JSON object containing the keys and new values to merge into the existing context bus."
-            }
-        },
-        "required": ["updates"]
-    }
-)
-
 FUNCTION_MAP = {
-    "read_file": read_file_func,
-    "create_artifact": create_artifact_func,
-    "write_code": write_code_func,
-    "execute_command": execute_command_func,
-    "update_task_status": update_task_status_func,
-    "list_directory": list_directory_func,
-    "search_code": search_code_func,
-    "read_context": read_context_func,
-    "update_context": update_context_func,
+    "read_file": FunctionDeclaration(name="read_file", description="Reads a file.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}),
+    "create_artifact": FunctionDeclaration(name="create_artifact", description="Creates a file.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
+    "write_code": FunctionDeclaration(name="write_code", description="Writes code.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
+    "execute_command": FunctionDeclaration(name="execute_command", description="Runs a terminal command.", parameters={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+    "update_task_status": FunctionDeclaration(name="update_task_status", description="Updates task.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "task_string": {"type": "string"}, "new_status": {"type": "string"}}, "required": ["filepath", "task_string", "new_status"]}),
+    "list_directory": FunctionDeclaration(name="list_directory", description="Lists a dir.", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+    "search_code": FunctionDeclaration(name="search_code", description="Searches code.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "directory": {"type": "string"}}, "required": ["query", "directory"]}),
+    "read_context": FunctionDeclaration(name="read_context", description="Reads context.", parameters={"type": "object", "properties": {}}),
+    "update_context": FunctionDeclaration(name="update_context", description="Updates context.", parameters={"type": "object", "properties": {"updates": {"type": "object"}}, "required": ["updates"]}),
 }
 
 def _get_tools_for_agent(agent_config: dict) -> list:
-    """Reads the 'tools' list from the YAML config and returns Vertex AI Tools."""
     tool_names = agent_config.get("tools", [])
-    if not tool_names:
-        return None
-    
-    declarations = [FUNCTION_MAP[name] for name in tool_names if name in FUNCTION_MAP]
-    if declarations:
-        return [Tool(function_declarations=declarations)]
-    return None
+    if not tool_names: return None
+    declarations = [FUNCTION_MAP[n] for n in tool_names if n in FUNCTION_MAP]
+    return [Tool(function_declarations=declarations)] if declarations else None
 
 # ---------------------------------------------------------------------------
 # ForgeEngine
 # ---------------------------------------------------------------------------
 class ForgeEngine:
-
     def __init__(self):
-        self.configs = {}
+        # Assign the baked dict directly. No file reading needed!
+        self.configs = AGENT_CONFIGS
         self._initialized = False
-        
-        # 🔥 NEW: Bake configs into memory AT DEPLOYMENT TIME
-        config_dir = Path(__file__).parent / "agent_configs"
-        if not config_dir.exists():
-            config_dir = Path("agent_configs")
-        
-        logger.info(f"Baking agent configs into memory from: {config_dir}")
-        if config_dir.exists():
-            for config_file in config_dir.glob("*.yaml"):
-                with open(config_file, "r") as f:
-                    self.configs[config_file.stem] = yaml.safe_load(f)
-                logger.info(f"  Loaded into memory: {config_file.stem}")
 
     def _ensure_initialized(self):
-        if self._initialized:
-            return
-        logger.info("Initialising Forge Engine Cloud Dependencies…")
+        if self._initialized: return
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "nastwest-u26wck-607")
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        logger.info(f"Vertex AI project={project} location={location}")
         vertexai.init(project=project, location=location)
-
         self._initialized = True
-        logger.info("Forge Engine initialised successfully.")
 
-    # ------------------------------------------------------------------
-    def query(
-        self,
-        agent_name: str,
-        prompt: str = None,
-        context: str = None,
-        message: str = None,
-        chat_history: list = None,
-    ) -> dict:
+    def query(self, agent_name: str, prompt: str = None, context: str = None, message: str = None, chat_history: list = None) -> dict:
         self._ensure_initialized()
-
         if message is not None:
             return self._send_message_to_agent(agent_name, message, chat_history)
+        return self._send_message_to_agent(agent_name, prompt, [])
 
-        initial_prompt = prompt
-        return self._send_message_to_agent(agent_name, initial_prompt, [])
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _extract_function_calls(response):
-        calls = []
-        try:
-            for part in response.candidates[0].content.parts:
-                try:
-                    if part.function_call:
-                        calls.append(part.function_call)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"_extract_function_calls error: {e}")
-        return calls
-
-    @staticmethod
-    def _extract_text(response):
-        text = ""
-        try:
-            for part in response.candidates[0].content.parts:
-                try:
-                    text += part.text + "\n"
-                except Exception:
-                    pass 
-        except Exception as e:
-            logger.warning(f"_extract_text error: {e}")
-        return text.strip()
-
-    # ------------------------------------------------------------------
-    def _send_message_to_agent(
-        self,
-        agent_name: str,
-        message: str,
-        chat_history: list = None,
-    ) -> dict:
-        self._ensure_initialized()
-
+    def _send_message_to_agent(self, agent_name: str, message: str, chat_history: list = None) -> dict:
         if agent_name not in self.configs:
             err = f"Error: Agent '{agent_name}' not found."
-            logger.error(err)
             return {"type": "text", "text": err, "raw_assistant_message": {"role": "model", "parts": [{"text": err}]}}
 
         config = self.configs[agent_name]
-        model_name = config["model"]
-        logger.info(f"_send_message_to_agent — agent={agent_name} model={model_name}")
-
-        agent_tools = _get_tools_for_agent(config)
-        model = GenerativeModel(
-            model_name,
-            system_instruction=config["instructions"],
-            tools=agent_tools
-        )
+        model = GenerativeModel(config["model"], system_instruction=config["instructions"], tools=_get_tools_for_agent(config))
 
         import vertexai.generative_models as gm
         contents = []
-
         if chat_history:
-            logger.debug(f"Reconstructing chat history ({len(chat_history)} messages)")
-            for idx, msg in enumerate(chat_history):
-                role = msg["role"]
+            for msg in chat_history:
                 parts = []
                 for p in msg["parts"]:
-                    if "text" in p:
-                        parts.append(Part.from_text(p["text"]))
-                    elif "functionCall" in p:
-                        parts.append(Part.from_dict({"function_call": p["functionCall"]}))
-                    elif "functionResponse" in p:
-                        parts.append(Part.from_function_response(
-                            name=p["functionResponse"]["name"],
-                            response=p["functionResponse"]["response"]
-                        ))
-                contents.append(gm.Content(role=role, parts=parts))
+                    if "text" in p: parts.append(Part.from_text(p["text"]))
+                    elif "functionCall" in p: parts.append(Part.from_dict({"function_call": p["functionCall"]}))
+                    elif "functionResponse" in p: parts.append(Part.from_function_response(name=p["functionResponse"]["name"], response=p["functionResponse"]["response"]))
+                contents.append(gm.Content(role=msg["role"], parts=parts))
 
-        try:
-            parsed_msg = json.loads(message)
-        except json.JSONDecodeError:
-            parsed_msg = None
+        try: parsed_msg = json.loads(message)
+        except: parsed_msg = None
 
         if isinstance(parsed_msg, list) and parsed_msg and "functionResponse" in parsed_msg[0]:
-            logger.debug(f"Appending {len(parsed_msg)} functionResponse part(s)")
-            new_parts = []
-            for p in parsed_msg:
-                fr = p["functionResponse"]
-                new_parts.append(Part.from_function_response(
-                    name=fr["name"],
-                    response=fr["response"]
-                ))
+            new_parts = [Part.from_function_response(name=p["functionResponse"]["name"], response=p["functionResponse"]["response"]) for p in parsed_msg]
             contents.append(gm.Content(role="user", parts=new_parts))
         else:
-            logger.debug(f"Appending text user message: {_truncate(message)}")
             contents.append(gm.Content(role="user", parts=[Part.from_text(message)]))
 
-        logger.info(
-            f"Calling generate_content — agent={agent_name} "
-            f"total_turns={len(contents)} model={model_name}"
-        )
-
-        clog("GENERATE_CONTENT_REQUEST", severity="INFO",
-             agent=agent_name,
-             model=model_name,
-             num_turns=len(contents),
-             contents=_serialise_contents(contents))
-
-        t_start = time.time()
+        response = model.generate_content(contents)
+        
+        fn_calls = []
+        text = ""
         try:
-            response = model.generate_content(contents)
-        except Exception as exc:
-            clog("GENERATE_CONTENT_ERROR", severity="ERROR",
-                 agent=agent_name, error=str(exc))
-            raise
-
-        duration_ms = int((time.time() - t_start) * 1000)
-
-        fn_calls = self._extract_function_calls(response)
-        response_text = self._extract_text(response)
-
-        try:
-            finish_reason = str(response.candidates[0].finish_reason)
-        except Exception:
-            finish_reason = "unknown"
-
-        clog("GENERATE_CONTENT_RESPONSE", severity="INFO",
-             agent=agent_name,
-             model=model_name,
-             duration_ms=duration_ms,
-             finish_reason=finish_reason,
-             response_text=response_text,
-             function_calls=[
-                 {"name": c.name, "args": {k: v for k, v in c.args.items()}}
-                 for c in fn_calls
-             ])
+            for p in response.candidates[0].content.parts:
+                try: 
+                    if p.function_call: fn_calls.append(p.function_call)
+                except: 
+                    try: text += p.text + "\n"
+                    except: pass
+        except: pass
 
         if fn_calls:
-            serialized_calls = [
-                {"name": c.name, "args": {k: v for k, v in c.args.items()}}
-                for c in fn_calls
-            ]
-            
-            parts = []
-            if response_text:
-                parts.append({"text": response_text})
-            for c in fn_calls:
-                parts.append({"functionCall": {"name": c.name, "args": {k: v for k, v in c.args.items()}}})
-                
-            result = {
-                "type": "function_calls",
-                "calls": serialized_calls,
-                "text": response_text,
-                "raw_assistant_message": {
-                    "role": "model",
-                    "parts": parts
-                }
-            }
+            calls = [{"name": c.name, "args": {k: v for k, v in c.args.items()}} for c in fn_calls]
+            parts = [{"text": text.strip()}] if text.strip() else []
+            for c in calls: parts.append({"functionCall": c})
+            return {"type": "function_calls", "calls": calls, "text": text.strip(), "raw_assistant_message": {"role": "model", "parts": parts}}
         else:
-            result = {
-                "type": "text",
-                "text": response_text,
-                "raw_assistant_message": {
-                    "role": "model",
-                    "parts": [{"text": response_text}] if response_text else []
-                }
-            }
-
-        clog("OUTGOING_RESPONSE", severity="INFO",
-             agent=agent_name,
-             result_type=result["type"],
-             response_text=response_text,
-             function_calls=result.get("calls", []))
-
-        return result
+            return {"type": "text", "text": text.strip(), "raw_assistant_message": {"role": "model", "parts": [{"text": text.strip()}]}}
 
 # For Vertex Agent Engine
 app = ForgeEngine()
