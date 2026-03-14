@@ -88,6 +88,24 @@ class WorkspaceTools {
         }
     }
 
+    // 🔥 NEW TOOL: Tailing logs to prevent context window overflow
+    static async tailLog(filepath: string, lines: number = 100): Promise<string> {
+        try {
+            const root = this.getWorkspaceRoot();
+            const fullPath = path.isAbsolute(filepath) ? filepath : path.join(root, filepath);
+            const content = await fs.promises.readFile(fullPath, 'utf8');
+
+            const allLines = content.split('\n');
+            if (allLines.length > lines) {
+                const tail = allLines.slice(-lines).join('\n');
+                return `... [SYSTEM: LOG TRUNCATED. SHOWING LAST ${lines} LINES] ...\n\n${tail}`;
+            }
+            return content;
+        } catch (error: any) {
+            return `Error tailing log: ${error.message}`;
+        }
+    }
+
     static async createArtifact(filepath: string, content: string): Promise<string> {
         try {
             const fullPath = path.resolve(this.getWorkspaceRoot(), filepath);
@@ -265,9 +283,8 @@ export function activate(context: vscode.ExtensionContext) {
                     });
 
                     const currentResponse: any = (turnResponse.data as any).output;
-                    logApiResponse(currentAgent, (50 - globalMaxIter), (10 - turnIter), currentResponse, Date.now() - t0);
+                    logApiResponse(currentAgent!, (50 - globalMaxIter), (10 - turnIter), currentResponse, Date.now() - t0);
 
-                    // Update history with the model's response
                     if (currentResponse.raw_assistant_message) {
                         chatHistory.push(currentResponse.raw_assistant_message);
                     }
@@ -276,7 +293,6 @@ export function activate(context: vscode.ExtensionContext) {
                         const text: string = currentResponse.text || "";
                         await WorkspaceTools.appendToTrace(`[${currentAgent}] Output: ${text}`);
 
-                        // Transition logic
                         if (currentAgent === "workspace_analyzer" || currentAgent === "recovery_agent") {
                             currentAgent = "orchestrator";
                             currentPrompt = `Workspace state report: ${text}`;
@@ -285,16 +301,16 @@ export function activate(context: vscode.ExtensionContext) {
                                 const jsonStr = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1);
                                 const dagState = JSON.parse(jsonStr);
                                 currentAgent = dagState.next_agent_routing !== "none" ? dagState.next_agent_routing : null;
-                                currentPrompt = `Proceed with tasks: ${JSON.stringify(dagState.active_tasks)}`;
+                                currentPrompt = currentAgent ? `Proceed with tasks: ${JSON.stringify(dagState.active_tasks)}` : null;
                             } catch (e) {
-                                currentAgent = null; // Exit on parse error
+                                currentAgent = null;
                             }
                         } else {
                             currentAgent = "workspace_analyzer";
                             currentPrompt = `Verify work finished: ${text}`;
                         }
 
-                        chatHistory = []; // Reset history for the next agent
+                        chatHistory = [];
                         isFinished = true;
                         ForgeDashboard.sendEvent({ type: 'agent_done', agent: currentAgent || 'done' });
                     }
@@ -306,6 +322,8 @@ export function activate(context: vscode.ExtensionContext) {
 
                             let result = "";
                             if (call.name === "read_file") result = await WorkspaceTools.readFile(call.args.filepath);
+                            // 🔥 NEW ROUTING: Map the model's tool call to the new tailLog workspace tool
+                            else if (call.name === "tail_log") result = await WorkspaceTools.tailLog(call.args.filepath, call.args.lines || 100);
                             else if (call.name === "create_artifact") result = await WorkspaceTools.createArtifact(call.args.filepath, call.args.content);
                             else if (call.name === "write_code") result = await WorkspaceTools.writeCode(call.args.filepath, call.args.content);
                             else if (call.name === "execute_command") result = await WorkspaceTools.executeCommand(call.args.command);
@@ -319,10 +337,9 @@ export function activate(context: vscode.ExtensionContext) {
                                     response: { content: result }
                                 }
                             });
-                            ForgeDashboard.sendEvent({ type: 'tool_result', agent: currentAgent, data: { name: call.name } });
+                            ForgeDashboard.sendEvent({ type: 'tool_result', agent: currentAgent!, data: { name: call.name } });
                         }
 
-                        // 🔥 CRITICAL FIX: Package responses as a user turn and continue the inner loop
                         const toolUserTurn = { role: "user", parts: toolResults };
                         chatHistory.push(toolUserTurn);
                         nextMessage = JSON.stringify(toolResults);

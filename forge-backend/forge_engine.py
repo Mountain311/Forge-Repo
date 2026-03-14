@@ -46,6 +46,19 @@ def clog(event: str, severity: str = "DEBUG", **fields):
 # ---------------------------------------------------------------------------
 FUNCTION_MAP = {
     "read_file": FunctionDeclaration(name="read_file", description="Reads a file.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}),
+    # 🔥 NEW TOOL SCHEMA ADDED HERE:
+    "tail_log": FunctionDeclaration(
+        name="tail_log", 
+        description="Reads the last N lines of a log file. Use this specifically for trace logs to avoid overloading context.", 
+        parameters={
+            "type": "object", 
+            "properties": {
+                "filepath": {"type": "string"},
+                "lines": {"type": "integer", "description": "Number of lines to read from the bottom (default 100)"}
+            }, 
+            "required": ["filepath"]
+        }
+    ),
     "create_artifact": FunctionDeclaration(name="create_artifact", description="Creates a file.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
     "write_code": FunctionDeclaration(name="write_code", description="Writes code.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
     "execute_command": FunctionDeclaration(name="execute_command", description="Runs a terminal command.", parameters={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
