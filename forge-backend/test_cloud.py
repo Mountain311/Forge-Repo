@@ -5,7 +5,7 @@ import json
 vertexai.init(project="nastwest-u26wck-607", location="us-central1")
 
 # The exact ID from your last successful deployment
-ENDPOINT_ID = "projects/718442730167/locations/us-central1/reasoningEngines/5760225969197547520"
+ENDPOINT_ID = "projects/718442730167/locations/us-central1/reasoningEngines/1338254085073141760"
 
 print(f"Connecting to Cloud Endpoint: {ENDPOINT_ID}\n")
 engine = reasoning_engines.ReasoningEngine(ENDPOINT_ID)

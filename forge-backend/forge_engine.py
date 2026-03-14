@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 import vertexai
 from vertexai.generative_models import GenerativeModel, Tool, Part, FunctionDeclaration
-from tools import tool_map
 
 # ---------------------------------------------------------------------------
 # Logging Setup — writes structured JSON directly to Google Cloud Logging
@@ -103,7 +102,7 @@ read_file_func = FunctionDeclaration(
     }
 )
 
-# 🔥 NEW: ADDED TAIL_LOG SCHEMA
+# 🔥 NEW: TAIL_LOG SCHEMA
 tail_log_func = FunctionDeclaration(
     name="tail_log",
     description="Reads the last N lines of a log file. Use this specifically for trace logs to avoid overloading context.",
@@ -220,68 +219,71 @@ class ForgeEngine:
         logger.info(f"Vertex AI project={project} location={location}")
         vertexai.init(project=project, location=location)
 
-        config_files = []
-        search_roots = [
-            Path(__file__).resolve().parent,
-            Path.cwd(),
-        ]
+        # 🔥 FIX: Load the pre-compiled dictionary deployed by deploy.py first
+        try:
+            from agent_registry import AGENT_CONFIGS
+            if AGENT_CONFIGS:
+                self.configs = AGENT_CONFIGS
+                logger.info(f"Loaded {len(self.configs)} configs from baked agent_registry.py")
+        except ImportError:
+            pass
 
-        for root in search_roots:
-            direct_dir = root / "agent_configs"
-            if direct_dir.exists() and direct_dir.is_dir():
-                direct_files = sorted(direct_dir.glob("*.yaml"))
-                if direct_files:
-                    logger.info(f"Loading agent configs from: {direct_dir}")
-                    config_files.extend(direct_files)
+        # Fallback to local YAML globbing if the registry is missing (e.g., local testing)
+        if not self.configs:
+            config_files = []
+            search_roots = [
+                Path(__file__).resolve().parent,
+                Path.cwd(),
+            ]
 
-        if not config_files:
             for root in search_roots:
-                recursive_files = sorted(root.glob("**/agent_configs/*.yaml"))
-                if recursive_files:
-                    logger.info(f"Found agent configs recursively under: {root}")
-                    config_files.extend(recursive_files)
+                direct_dir = root / "agent_configs"
+                if direct_dir.exists() and direct_dir.is_dir():
+                    direct_files = sorted(direct_dir.glob("*.yaml"))
+                    if direct_files:
+                        logger.info(f"Loading agent configs from: {direct_dir}")
+                        config_files.extend(direct_files)
 
-        if not config_files:
-            for root in search_roots:
-                flat_yaml_files = sorted(root.glob("*.yaml"))
-                candidate_flat_files = []
-                for yaml_file in flat_yaml_files:
-                    name = yaml_file.stem
-                    if name in {
-                        "orchestrator",
-                        "pm_agent",
-                        "architecture",
-                        "security",
-                        "dependencies",
-                        "tdd_coder",
-                        "data_leakage",
-                        "ethics",
-                        "review",
-                        "workspace_analyzer",
-                        "recovery_agent"
-                    }:
-                        candidate_flat_files.append(yaml_file)
-                if candidate_flat_files:
-                    logger.info(f"Found flat agent config YAML files under: {root}")
-                    config_files.extend(candidate_flat_files)
+            if not config_files:
+                for root in search_roots:
+                    recursive_files = sorted(root.glob("**/agent_configs/*.yaml"))
+                    if recursive_files:
+                        logger.info(f"Found agent configs recursively under: {root}")
+                        config_files.extend(recursive_files)
 
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_config_files = []
-        for f in config_files:
-            fp = str(f.resolve())
-            if fp not in seen:
-                seen.add(fp)
-                unique_config_files.append(f)
+            if not config_files:
+                for root in search_roots:
+                    flat_yaml_files = sorted(root.glob("*.yaml"))
+                    candidate_flat_files = []
+                    for yaml_file in flat_yaml_files:
+                        name = yaml_file.stem
+                        if name in {
+                            "orchestrator", "pm_agent", "architecture", "security",
+                            "dependencies", "tdd_coder", "data_leakage", "ethics",
+                            "review", "workspace_analyzer", "recovery_agent"
+                        }:
+                            candidate_flat_files.append(yaml_file)
+                    if candidate_flat_files:
+                        logger.info(f"Found flat agent config YAML files under: {root}")
+                        config_files.extend(candidate_flat_files)
 
-        logger.info(f"Discovered {len(unique_config_files)} agent config file(s)")
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_config_files = []
+            for f in config_files:
+                fp = str(f.resolve())
+                if fp not in seen:
+                    seen.add(fp)
+                    unique_config_files.append(f)
 
-        for config_file in unique_config_files:
-            with open(config_file, "r") as f:
-                config = yaml.safe_load(f)
-            agent_name = config_file.stem
-            self.configs[agent_name] = config
-            logger.info(f"  Loaded config: {agent_name} (model={config.get('model', '?')})")
+            logger.info(f"Discovered {len(unique_config_files)} agent config file(s)")
+
+            for config_file in unique_config_files:
+                with open(config_file, "r") as f:
+                    config = yaml.safe_load(f)
+                agent_name = config_file.stem
+                self.configs[agent_name] = config
+                logger.info(f"  Loaded config: {agent_name} (model={config.get('model', '?')})")
 
         if not self.configs:
             logger.error("No agent configs were loaded. Queries will fail with agent not found.")
