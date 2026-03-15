@@ -59,6 +59,16 @@ def clog(event: str, severity: str = "DEBUG", **fields):
 clog("ENGINE_INIT", severity="INFO", message="Forge Engine logging initialised")
 
 
+# ---------------------------------------------------------------------------
+# finish_reason constants
+# ---------------------------------------------------------------------------
+FINISH_REASON_STOP     = 1   # Normal completion — model finished cleanly
+FINISH_REASON_MAX_TOK  = 2   # Response cut off by token limit
+FINISH_REASON_SAFETY   = 3   # Safety filter block
+FINISH_REASON_RECIT    = 4   # Copyright / recitation block
+FINISH_REASON_OTHER    = 5   # Unspecified
+
+
 def _truncate(value: any, max_chars: int = 400) -> str:
     """Return a safely truncated string representation of any value."""
     s = value if isinstance(value, str) else json.dumps(value, default=str)
@@ -88,6 +98,36 @@ def _serialise_contents(contents: list) -> list:
     return result
 
 
+def _inspect_candidate(candidate) -> tuple[int, list, str]:
+    """
+    Extract finish_reason (int), raw_parts (list of strings), and
+    safety_ratings (str) from a Vertex AI candidate object.
+    Returns (-1, [], "unavailable") if inspection fails.
+    """
+    try:
+        finish_reason_int = int(candidate.finish_reason)
+        safety_ratings_raw = (
+            str(candidate.safety_ratings)
+            if hasattr(candidate, 'safety_ratings')
+            else "unavailable"
+        )
+        raw_parts = []
+        for p in candidate.content.parts:
+            try:
+                if hasattr(p, 'function_call') and p.function_call.name:
+                    raw_parts.append(f"[function_call: {p.function_call.name}]")
+                elif hasattr(p, 'text'):
+                    raw_parts.append(f"[text: {repr(p.text)}]")
+                else:
+                    raw_parts.append(f"[unknown part: {repr(p)}]")
+            except Exception as part_err:
+                raw_parts.append(f"[unreadable part: {part_err}]")
+        return finish_reason_int, raw_parts, safety_ratings_raw
+    except Exception as inspect_err:
+        clog("CANDIDATE_INSPECT_ERROR", severity="WARN", error=str(inspect_err))
+        return -1, [], "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Function Declaration Schemas
 # ---------------------------------------------------------------------------
@@ -102,7 +142,6 @@ read_file_func = FunctionDeclaration(
     }
 )
 
-# 🔥 NEW: TAIL_LOG SCHEMA
 tail_log_func = FunctionDeclaration(
     name="tail_log",
     description="Reads the last N lines of a log file. Use this specifically for trace logs to avoid overloading context.",
@@ -189,17 +228,27 @@ search_code_func = FunctionDeclaration(
     }
 )
 
-forge_tools = Tool(function_declarations=[
-    read_file_func,
-    tail_log_func, # 🔥 INJECTED HERE
-    create_artifact_func,
-    write_code_func,
-    execute_command_func,
-    update_task_status_func,
-    list_directory_func,
-    search_code_func,
-])
+# 🔥 FIX: Map string names from YAML to actual FunctionDeclarations
+FUNCTION_MAP = {
+    "read_file": read_file_func,
+    "create_artifact": create_artifact_func,
+    "write_code": write_code_func,
+    "execute_command": execute_command_func,
+    "update_task_status": update_task_status_func,
+    "list_directory": list_directory_func,
+    "search_code": search_code_func,
+    "tail_log": tail_log_func
+}
 
+def _get_tools_for_agent(agent_config: dict):
+    """Dynamically build the Tool array based ONLY on what the agent's YAML allows."""
+    tool_names = agent_config.get("tools", [])
+    if not tool_names:
+        return None  # No tools for this agent (e.g. Orchestrator)
+    declarations = [FUNCTION_MAP[n] for n in tool_names if n in FUNCTION_MAP]
+    if declarations:
+        return [Tool(function_declarations=declarations)]
+    return None
 
 # ---------------------------------------------------------------------------
 # ForgeEngine
@@ -219,7 +268,7 @@ class ForgeEngine:
         logger.info(f"Vertex AI project={project} location={location}")
         vertexai.init(project=project, location=location)
 
-        # 🔥 FIX: Load the pre-compiled dictionary deployed by deploy.py first
+        # Load the pre-compiled dictionary deployed by deploy.py first
         try:
             from agent_registry import AGENT_CONFIGS
             if AGENT_CONFIGS:
@@ -301,7 +350,6 @@ class ForgeEngine:
         chat_history: list = None,
     ) -> dict:
         """Public entrypoint. Multiplexes all agent tasks."""
-        # Log the full incoming request so it appears in Cloud Logging
         clog("INCOMING_REQUEST", severity="INFO",
              agent=agent_name,
              prompt=prompt,
@@ -371,12 +419,15 @@ class ForgeEngine:
 
         config = self.configs[agent_name]
         model_name = config["model"]
-        logger.info(f"_send_message_to_agent — agent={agent_name} model={model_name}")
+        
+        # 🔥 FIX: Retrieve only the tools specific to this agent
+        agent_tools = _get_tools_for_agent(config)
+        logger.info(f"_send_message_to_agent — agent={agent_name} tools={'none' if not agent_tools else 'assigned'}")
 
         model = GenerativeModel(
             model_name,
             system_instruction=config["instructions"],
-            tools=[forge_tools]
+            tools=agent_tools
         )
 
         # ── Reconstruct history ──────────────────────────────────────────
@@ -442,7 +493,6 @@ class ForgeEngine:
                     part_summaries.append("(unreadable part)")
             logger.debug(f"  contents[{i}] role={c.role} parts=[{', '.join(part_summaries)}]")
 
-        # Log EXACTLY what is being sent to the model
         clog("GENERATE_CONTENT_REQUEST", severity="INFO",
              agent=agent_name,
              model=model_name,
@@ -459,25 +509,78 @@ class ForgeEngine:
 
         duration_ms = int((time.time() - t_start) * 1000)
 
-        # 🔥 SAFETY / EMPTY RESPONSE CATCH 
+        # ── No candidates at all — hard block from Vertex ────────────────
         if not response.candidates:
             err_msg = "[BLOCKED BY VERTEX AI: No candidates returned. This is likely a Safety Filter block due to your prompt.]"
             clog("GENERATE_CONTENT_BLOCKED", severity="WARN", agent=agent_name)
-            return {"type": "text", "text": err_msg, "raw_assistant_message": {"role": "model", "parts": [{"text": err_msg}]}}
+            return {
+                "type": "text",
+                "text": err_msg,
+                "raw_assistant_message": {"role": "model", "parts": [{"text": err_msg}]}
+            }
 
         fn_calls = self._extract_function_calls(response)
         response_text = self._extract_text(response)
-        
-        # 🔥 SILENT FAILURE CATCH 
-        if not fn_calls and not response_text:
-            response_text = f"[SYSTEM ERROR: Agent '{agent_name}' returned an empty response. Verify safety filters and prompt constraints.]"
 
+        # ── Handle empty response (no text AND no tool calls) ────────────
+        # Inspect the candidate to find out why and respond appropriately.
+        if not fn_calls and not response_text:
+            finish_reason_int, raw_parts, safety_ratings_raw = _inspect_candidate(
+                response.candidates[0]
+            )
+
+            if finish_reason_int == FINISH_REASON_STOP:
+                # Model completed its turn cleanly with nothing to say.
+                # This is normal behaviour after tool use — not an error.
+                # Return empty text so the extension can route gracefully
+                # without injecting noise into the chat history.
+                clog("EMPTY_RESPONSE_STOP", severity="DEBUG",
+                     agent=agent_name,
+                     finish_reason=finish_reason_int,
+                     raw_parts=raw_parts,
+                     note="Model returned STOP with empty text — clean turn completion, not an error.")
+                response_text = ""
+
+            elif finish_reason_int == FINISH_REASON_MAX_TOK:
+                # Response was cut off mid-stream by the token limit.
+                clog("EMPTY_RESPONSE_MAX_TOKENS", severity="WARN",
+                     agent=agent_name,
+                     finish_reason=finish_reason_int,
+                     raw_parts=raw_parts)
+                response_text = f"[TRUNCATED: Agent '{agent_name}' hit the token limit mid-response. Consider breaking the task into smaller steps.]"
+
+            elif finish_reason_int == FINISH_REASON_SAFETY:
+                # Hard safety filter block.
+                clog("EMPTY_RESPONSE_SAFETY_BLOCK", severity="WARN",
+                     agent=agent_name,
+                     finish_reason=finish_reason_int,
+                     safety_ratings=safety_ratings_raw,
+                     raw_parts=raw_parts)
+                response_text = f"[SAFETY BLOCK: Agent '{agent_name}' was blocked by Vertex AI safety filters. Check the prompt for policy-violating content.]"
+
+            elif finish_reason_int == FINISH_REASON_RECIT:
+                # Copyright / recitation block.
+                clog("EMPTY_RESPONSE_RECITATION", severity="WARN",
+                     agent=agent_name,
+                     finish_reason=finish_reason_int,
+                     raw_parts=raw_parts)
+                response_text = f"[RECITATION BLOCK: Agent '{agent_name}' was blocked due to recitation of copyrighted content.]"
+
+            else:
+                # Unknown or OTHER — log with full detail and surface as error.
+                clog("EMPTY_RESPONSE_UNKNOWN", severity="WARN",
+                     agent=agent_name,
+                     finish_reason=finish_reason_int,
+                     safety_ratings=safety_ratings_raw,
+                     raw_parts=raw_parts)
+                response_text = f"[SYSTEM ERROR: Agent '{agent_name}' returned an empty response. finish_reason={finish_reason_int}]"
+
+        # ── Get finish_reason for the response log ───────────────────────
         try:
             finish_reason = str(response.candidates[0].finish_reason)
         except Exception:
             finish_reason = "unknown"
 
-        # Log EXACTLY what came back from the model
         clog("GENERATE_CONTENT_RESPONSE", severity="INFO",
              agent=agent_name,
              model=model_name,
@@ -517,7 +620,6 @@ class ForgeEngine:
                 }
             }
 
-        # Log the full response being returned to the VS Code extension
         clog("OUTGOING_RESPONSE", severity="INFO",
              agent=agent_name,
              result_type=result["type"],
